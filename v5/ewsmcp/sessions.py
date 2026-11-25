@@ -41,7 +41,7 @@ from dataclasses import dataclass, field
 from typing import Any, AsyncIterator, Callable, Dict, Optional
 
 from .errors import ToolError
-from .gateway.client import BEARER_HINT, EWSGateway
+from .gateway.client import BEARER_HINT, EWSGateway, WorkerGate
 from .identity import Principal, mailbox_key
 
 logger = logging.getLogger(__name__)
@@ -218,6 +218,12 @@ class SessionPool:
             thread_name_prefix="ews",
         )
         self._gateway_factory = gateway_factory or self._default_gateway
+        # Exchange requests in flight from this process, all mailboxes and
+        # token proofs included; overflow is shed after a short wait.
+        self.workers = WorkerGate(int(settings.ews_max_concurrency),
+                                  float(settings.ews_queue_timeout_seconds))
+        # Mirror refresh counters shared with every WindowSync (metrics).
+        self.refresh_stats: Dict[str, int] = {"refreshes": 0, "skipped": 0, "failed": 0}
         self._sessions: Dict[str, MailboxSession] = {}
         self._rejected: "OrderedDict[str, float]" = OrderedDict()
         self._version: Any = None
@@ -237,7 +243,7 @@ class SessionPool:
                          slots: asyncio.Semaphore) -> EWSGateway:
         return EWSGateway(
             self.settings, principal=principal, executor=self.executor,
-            request_slots=slots, version=self._version,
+            request_slots=slots, worker_gate=self.workers, version=self._version,
         )
 
     # ------------------------------------------------------- binding calls
@@ -300,7 +306,7 @@ class SessionPool:
                 return
             loop = asyncio.get_running_loop()
             try:
-                async with session.request_slots:
+                async with session.request_slots, self.workers.slot():
                     await loop.run_in_executor(self.executor, gateway.prove)
             except ToolError as err:
                 if err.code == "auth_failed":
@@ -470,4 +476,10 @@ class SessionPool:
             "evictions": self.evictions,
             "idle_seconds": self.idle_seconds,
             "upstream_circuit_open": self.upstream_retry_after() is not None,
+            "workers_busy": self.workers.busy,
+            "workers_max": self.workers.size,
+            "calls_shed": self.workers.shed,
+            "mirror_refreshes": self.refresh_stats["refreshes"],
+            "mirror_refreshes_skipped": self.refresh_stats["skipped"],
+            "mirror_refreshes_failed": self.refresh_stats["failed"],
         }

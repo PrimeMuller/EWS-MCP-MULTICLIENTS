@@ -25,7 +25,8 @@ import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from contextlib import AsyncExitStack, asynccontextmanager
+from typing import Any, AsyncIterator, Callable, Dict, List, Optional, Tuple
 
 import requests.auth
 from exchangelib import (
@@ -55,6 +56,7 @@ from exchangelib.transport import AUTH_TYPE_MAP
 from ..config import Settings
 from ..errors import AUTH_FAILED_HINT, ToolError, map_exception
 from ..identity import Principal
+from ..throttle import LocalRefusal
 
 logger = logging.getLogger(__name__)
 
@@ -403,6 +405,48 @@ class AuthBreaker:
             }
 
 
+SHED_RETRY_AFTER_SECONDS = 3
+SHED_HINT = (
+    "This server is at its limit of requests in flight to Exchange, so the "
+    "call was not sent. Wait retry_after_s seconds and try again."
+)
+
+
+class WorkerGate:
+    """The process-wide cap on Exchange requests in flight, with load shedding.
+
+    Sized like the worker pool, so work never queues inside the executor:
+    a call waits here, on the event loop, for at most ``timeout`` seconds and
+    is then refused with ``throttled`` + ``retry_after_s`` — Exchange never
+    sees it. Under overload the server sheds calls instead of building a
+    queue whose latency nobody can bound.
+    """
+
+    def __init__(self, size: int, timeout: float):
+        self.size = max(1, int(size))
+        self.timeout = float(timeout)
+        self._sem = asyncio.Semaphore(self.size)
+        self.busy = 0
+        self.shed = 0
+
+    @asynccontextmanager
+    async def slot(self) -> AsyncIterator[None]:
+        try:
+            await asyncio.wait_for(self._sem.acquire(), self.timeout)
+        except asyncio.TimeoutError:
+            self.shed += 1
+            raise LocalRefusal(
+                "throttled", "Server busy: no Exchange worker became free in time.",
+                hint=SHED_HINT, retry_after_s=SHED_RETRY_AFTER_SECONDS,
+            ) from None
+        self.busy += 1
+        try:
+            yield
+        finally:
+            self.busy -= 1
+            self._sem.release()
+
+
 class EWSGateway:
     def __init__(
         self,
@@ -412,6 +456,7 @@ class EWSGateway:
         principal: Optional[Principal] = None,
         executor: Optional[ThreadPoolExecutor] = None,
         request_slots: Optional[asyncio.Semaphore] = None,
+        worker_gate: Optional[WorkerGate] = None,
         version: Any = None,
     ):
         """One credential's connection to Exchange.
@@ -448,6 +493,7 @@ class EWSGateway:
             thread_name_prefix="ews",
         )
         self._slots = request_slots
+        self._workers = worker_gate
         self._version = version
         # Bearer mode: set once Exchange has accepted this token for this
         # mailbox (see prove()); the session layer hands out the mailbox's
@@ -736,11 +782,16 @@ class EWSGateway:
         Two caps apply: the mailbox's request slots (when given) bound how
         many requests ONE mailbox has in flight — waiting here, on the event
         loop, instead of holding a worker thread — and the shared pool size
-        bounds the whole process.
+        bounds the whole process; with a worker gate, a call that cannot get
+        a worker in time is shed instead of queued.
         """
-        if self._slots is None:
+        if self._slots is None and self._workers is None:
             return await self._call_on_pool(fn)
-        async with self._slots:
+        async with AsyncExitStack() as caps:
+            if self._slots is not None:
+                await caps.enter_async_context(self._slots)
+            if self._workers is not None:
+                await caps.enter_async_context(self._workers.slot())
             return await self._call_on_pool(fn)
 
     async def _call_on_pool(self, fn: Callable[[Account], Any]) -> Any:

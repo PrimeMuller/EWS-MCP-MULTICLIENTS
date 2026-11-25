@@ -56,11 +56,13 @@ class WindowSync:
     """Refreshes one mailbox's window mirror when its user is active."""
 
     def __init__(self, settings: Any, store: CacheStore, *, limiter: asyncio.Semaphore,
-                 clock: Callable[[], float] = time.time):
+                 clock: Callable[[], float] = time.time,
+                 stats: Optional[Dict[str, int]] = None):
         self.settings = settings
         self.store = store
         self._limiter = limiter
         self._clock = clock
+        self._stats = stats if stats is not None else {}
         self.folder_keys = [
             k.strip().lower()
             for k in (settings.ews_cache_folders or "").split(",") if k.strip()
@@ -88,6 +90,7 @@ class WindowSync:
             return False
         if self._limiter.locked():
             self.skipped += 1  # the process is at its refresh cap; a later call retries
+            self._count("skipped")
             return False
         self.last_attempt_ts = now
         self._task = asyncio.create_task(self._refresh(gateway), name="mirror-refresh")
@@ -98,13 +101,18 @@ class WindowSync:
             async with self._limiter:
                 await gateway.call(self.refresh_once)
             self.refreshes += 1
+            self._count("refreshes")
             self.last_refresh_ts = self._clock()
             self.last_error = None
         except asyncio.CancelledError:
             raise
         except Exception as exc:
+            self._count("failed")
             self.last_error = type(exc).__name__
             logger.warning("mirror refresh failed (%s); reads stay live", self.last_error)
+
+    def _count(self, name: str) -> None:
+        self._stats[name] = self._stats.get(name, 0) + 1
 
     async def stop(self) -> None:
         self._stopped = True

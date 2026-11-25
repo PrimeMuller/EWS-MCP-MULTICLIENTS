@@ -149,7 +149,36 @@ def _metrics_text(ctx) -> str:
     if ctx.semantic is not None:
         lines.append("# TYPE ewsmcp_semantic_enabled gauge")
         lines.append("ewsmcp_semantic_enabled 1")
+    if ctx.pool is not None:
+        lines += _pool_metrics(ctx.pool.stats())
     return "\n".join(lines) + "\n"
+
+
+# Bearer-mode pool metrics: aggregates only. No per-mailbox labels — they
+# would explode series cardinality and reveal who is using the assistant.
+_POOL_METRICS = (
+    ("ewsmcp_mailbox_sessions", "gauge", "mailboxes"),
+    ("ewsmcp_mailbox_tokens", "gauge", "tokens"),
+    ("ewsmcp_calls_in_flight", "gauge", "in_flight"),
+    ("ewsmcp_rejected_tokens", "gauge", "rejected_tokens"),
+    ("ewsmcp_session_evictions_total", "counter", "evictions"),
+    ("ewsmcp_exchange_workers_busy", "gauge", "workers_busy"),
+    ("ewsmcp_exchange_workers_max", "gauge", "workers_max"),
+    ("ewsmcp_calls_shed_total", "counter", "calls_shed"),
+    ("ewsmcp_mirror_refreshes_total", "counter", "mirror_refreshes"),
+    ("ewsmcp_mirror_refreshes_skipped_total", "counter", "mirror_refreshes_skipped"),
+    ("ewsmcp_mirror_refreshes_failed_total", "counter", "mirror_refreshes_failed"),
+)
+
+
+def _pool_metrics(stats: Dict[str, Any]) -> list:
+    lines = []
+    for name, kind, key in _POOL_METRICS:
+        lines.append(f"# TYPE {name} {kind}")
+        lines.append(f"{name} {int(stats.get(key) or 0)}")
+    lines.append("# TYPE ewsmcp_upstream_circuit_open gauge")
+    lines.append(f"ewsmcp_upstream_circuit_open {1 if stats.get('upstream_circuit_open') else 0}")
+    return lines
 
 
 def _openapi(ctx) -> Dict[str, Any]:

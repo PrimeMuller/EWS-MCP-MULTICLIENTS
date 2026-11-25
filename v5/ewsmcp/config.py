@@ -60,6 +60,9 @@ class Settings(BaseSettings):
     # exchangelib connection count). Exchange's own per-user EWS limit is far
     # higher; staying at 2-3 keeps a single busy assistant a polite guest.
     ews_mailbox_max_concurrency: int = Field(default=2, ge=1, le=8)
+    # Bearer mode: how long a call may wait for a free Exchange worker before
+    # it is shed with `throttled` + retry_after_s (never sent to Exchange).
+    ews_queue_timeout_seconds: float = Field(default=10.0, ge=0.5, le=120.0)
     # A mailbox's session (connections, mirror) is closed after this long
     # without calls; past EWS_MAX_MAILBOXES the least recently used idle
     # sessions go first.

@@ -232,3 +232,86 @@ def test_local_refusals_never_count_as_exchange_failures(tmp_path):
     assert results[0].get("done") is True
     assert {r["error"]["code"] for r in results[1:]} == {"rate_capped"}
     assert ctx.pool.upstream.failures == 0
+
+
+# --- load shedding -------------------------------------------------------------
+
+
+def test_calls_that_cannot_get_a_worker_in_time_are_shed_not_queued():
+    from ewsmcp.gateway.client import WorkerGate
+    from ewsmcp.throttle import LocalRefusal
+
+    async def scenario():
+        gate = WorkerGate(size=1, timeout=0.05)
+        async with gate.slot():
+            assert gate.busy == 1
+            with pytest.raises(LocalRefusal) as info:
+                async with gate.slot():
+                    pass
+        async with gate.slot():  # free again afterwards
+            pass
+        return gate, info.value
+
+    gate, refusal = asyncio.run(scenario())
+    assert refusal.code == "throttled" and refusal.retry_after_s >= 1
+    assert gate.shed == 1 and gate.busy == 0
+
+
+def test_a_saturated_server_sheds_calls_through_the_dispatcher(tmp_path):
+    ctx = bearer_ctx(tmp_path, ews_queue_timeout_seconds=0.5)
+
+    class GatedGateway:
+        """Runs handler work through the pool's real worker gate."""
+
+        def __init__(self, principal, slots):
+            self.principal, self.mailbox = principal, principal.mailbox
+            self.proven, self.closed, self.rejected = True, False, False
+            self.slots = slots
+
+        async def call(self, fn):
+            async with self.slots, ctx.pool.workers.slot():
+                return fn(None)
+
+        def learned_version(self):
+            return None
+
+        def close(self):
+            self.closed = True
+
+    ctx.pool._gateway_factory = GatedGateway
+
+    async def handler(ctx, **_):
+        return {"done": await ctx.gateway.call(lambda _a: True)}
+
+    ctx.registry["t"] = ToolSpec(name="t", description="t", side_effect_class="read",
+                                 input_schema={"type": "object", "properties": {}},
+                                 handler=handler)
+
+    async def scenario():
+        held = []
+        for _ in range(ctx.pool.workers.size):  # every worker busy elsewhere
+            await ctx.pool.workers._sem.acquire()
+            held.append(True)
+        try:
+            return await call_as(ctx, token_for("alice@corp.example"), "t")
+        finally:
+            for _ in held:
+                ctx.pool.workers._sem.release()
+
+    shed = asyncio.run(scenario())
+    assert shed["error"]["code"] == "throttled"
+    assert "busy" in shed["error"]["message"]
+    assert ctx.pool.stats()["calls_shed"] == 1
+    assert ctx.pool.upstream.failures == 0  # shedding is not an Exchange failure
+
+
+def test_pool_metrics_are_aggregate_only(tmp_path):
+    from ewsmcp.http import _metrics_text
+
+    ctx = bearer_ctx(tmp_path)
+    asyncio.run(call_as(ctx, token_for("alice@corp.example"), "whoami"))
+    text = _metrics_text(ctx)
+    assert "ewsmcp_mailbox_sessions 1" in text
+    assert "ewsmcp_exchange_workers_max 32" in text
+    assert "ewsmcp_calls_shed_total 0" in text
+    assert "alice" not in text

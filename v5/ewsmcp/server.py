@@ -57,6 +57,7 @@ def mailbox_parts_factory(
     settings: Settings,
     *,
     refresh_limiter: Optional[asyncio.Semaphore] = None,
+    refresh_stats: Optional[Dict[str, int]] = None,
 ) -> Callable[[str, str], SessionParts]:
     """Build one mailbox's stored state: its own alias store and audit chain
     under ``DATA_DIR/mailboxes/<key>`` and, when the mirror is enabled, an
@@ -93,7 +94,7 @@ def mailbox_parts_factory(
             try:
                 cache = CacheStore(mailbox_cache_path(settings, key),
                                    body_chars=settings.ews_cache_body_chars)
-                syncer = WindowSync(settings, cache, limiter=limiter)
+                syncer = WindowSync(settings, cache, limiter=limiter, stats=refresh_stats)
             except Exception as exc:
                 logger.error("mailbox mirror init failed (%s) — live reads", exc)
                 cache, syncer = None, None
@@ -121,8 +122,10 @@ def build_bearer_context(settings: Settings) -> Context:
         logger.error("audit init failed (%s) — audit disabled", exc)
         audit = _NullAudit()
     refresh_limiter = asyncio.Semaphore(settings.ews_cache_max_concurrent_refreshes)
+    refresh_stats: Dict[str, int] = {"refreshes": 0, "skipped": 0, "failed": 0}
     pool = SessionPool(settings, parts_factory=mailbox_parts_factory(
-        settings, refresh_limiter=refresh_limiter))
+        settings, refresh_limiter=refresh_limiter, refresh_stats=refresh_stats))
+    pool.refresh_stats = refresh_stats
     ctx = Context(
         settings=settings,
         gateway=None,
