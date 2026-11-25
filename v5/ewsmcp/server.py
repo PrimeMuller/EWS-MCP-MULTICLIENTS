@@ -144,6 +144,12 @@ def build_context(
     lease_retry_seconds: float = LEASE_RETRY_SECONDS,
 ) -> Context:
     state.configure(settings)
+    if settings.ews_state_backend == "redis" and not settings.send_confirm_secret:
+        logger.warning(
+            "EWS_STATE_BACKEND=redis without SEND_CONFIRM_SECRET: each process signs "
+            "confirm tokens with its own random secret, so a preview confirmed on "
+            "another process fails. Set the same SEND_CONFIRM_SECRET on every process."
+        )
     if settings.bearer_mode:
         return build_bearer_context(settings)
     gateway = EWSGateway(settings)

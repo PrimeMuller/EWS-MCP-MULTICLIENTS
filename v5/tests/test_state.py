@@ -308,3 +308,24 @@ def test_redis_backend_requires_a_url_and_the_parts_use_shared_aliases(tmp_path)
     parts = mailbox_parts_factory(settings)("alice@corp.example", "aaa111")
     assert isinstance(parts.aliaser, RedisAliaser)
     assert parts.aliaser.alias_for("RAW", "m") == "m1"
+
+
+def test_shared_state_without_a_shared_confirm_secret_warns_at_boot(monkeypatch, caplog):
+    import logging
+
+    from ewsmcp.server import build_context
+
+    monkeypatch.delenv("SEND_CONFIRM_SECRET", raising=False)
+    monkeypatch.setattr(state, "configure", lambda settings: state.backend())
+    settings = make_settings(ews_auth_mode="bearer", mcp_transport="http", ews_email=None,
+                             ews_state_backend="redis", ews_redis_url="redis://unused:6379/0")
+    with caplog.at_level(logging.WARNING, logger="ewsmcp.server"):
+        build_context(settings)
+    assert any("SEND_CONFIRM_SECRET" in r.getMessage() for r in caplog.records)
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="ewsmcp.server"):
+        build_context(make_settings(ews_auth_mode="bearer", mcp_transport="http",
+                                    ews_email=None, ews_state_backend="redis",
+                                    ews_redis_url="redis://unused:6379/0",
+                                    send_confirm_secret="shared-secret"))
+    assert not any("SEND_CONFIRM_SECRET" in r.getMessage() for r in caplog.records)
