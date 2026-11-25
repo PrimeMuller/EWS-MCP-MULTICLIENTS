@@ -469,6 +469,95 @@ def _extract_href(attr_slice: str) -> str:
     return ""
 
 
+# --- text the reader never sees ------------------------------------------------
+#
+# Mail written to steer an AI assistant hides its instructions from the human:
+# the person reading the message sees nothing, while a model given the text
+# would read every word. These helpers recognise the common inline ways of
+# hiding text so ``html_to_text_bounded(drop_hidden=True)`` can leave it out.
+# Covered: the ``hidden`` attribute and inline ``style`` with display:none,
+# visibility:hidden|collapse, opacity:0, font-size of 0-1px/pt (0 in any
+# unit), mso-hide:all, or a zero height/width box with overflow:hidden. Not
+# covered: rules in <style> blocks or stylesheets (class-based hiding), and
+# text coloured like its background.
+
+_VOID_TAGS = frozenset({
+    "area", "base", "br", "col", "embed", "hr", "img", "input", "keygen",
+    "link", "meta", "param", "source", "track", "wbr",
+})
+# A start tag of one of these closes an open element of the same name, so a
+# hidden <p> ends at the next <p> exactly as a browser renders it.
+_SAME_NAME_IMPLIED_END = frozenset({"p", "li", "dt", "dd", "option", "tr", "td", "th"})
+_HIDING_HINT_RE = re.compile(
+    r"hidden|display|visibility|opacity|font-size|mso-hide", re.IGNORECASE)
+_CSS_LENGTH_RE = re.compile(r"(\d{1,6}(?:\.\d{1,6})?|\.\d{1,6})([a-z%]{0,4})")
+_ZERO_BOX_PROPS = ("height", "max-height", "width", "max-width")
+
+
+def might_hide_text(html: str) -> bool:
+    """Cheap pre-check: can this markup hide text from its reader at all?"""
+    return bool(html) and _HIDING_HINT_RE.search(html) is not None
+
+
+def _css_length(value: str | None) -> tuple[float, str] | None:
+    if not value:
+        return None
+    m = _CSS_LENGTH_RE.fullmatch(value)
+    if m is None:
+        return None
+    return float(m.group(1)), m.group(2)
+
+
+def _style_hides(style: str) -> bool:
+    decls: dict[str, str] = {}
+    for decl in style.split(";"):
+        name, sep, value = decl.partition(":")
+        if not sep:
+            continue
+        value = _ascii_lower(value).replace("!important", "")
+        decls[_ascii_lower(name.strip())] = " ".join(value.split())
+    if decls.get("display") == "none" or decls.get("mso-hide") == "all":
+        return True
+    if decls.get("visibility") in ("hidden", "collapse"):
+        return True
+    opacity = _css_length(decls.get("opacity"))
+    if opacity is not None and opacity[1] in ("", "%") and opacity[0] == 0:
+        return True
+    size = _css_length(decls.get("font-size"))
+    if size is not None and (size[0] == 0 or (size[1] in ("px", "pt") and size[0] <= 1)):
+        return True
+    if decls.get("overflow") == "hidden":
+        for prop in _ZERO_BOX_PROPS:
+            box = _css_length(decls.get(prop))
+            if box is not None and box[0] == 0:
+                return True
+    return False
+
+
+def _attrs_hide_content(attr_slice: str) -> bool:
+    """True when a start tag's attributes hide its content from the reader."""
+    if not attr_slice:
+        return False
+    low = _ascii_lower(attr_slice)
+    if "hidden" not in low and "style" not in low:
+        return False
+    pos = 0
+    end = len(attr_slice)
+    while pos < end:
+        m = _ATTR_RE.match(attr_slice, pos)
+        if m is None or m.end() <= pos:
+            break
+        pos = m.end()
+        name = _ascii_lower(m.group(1))
+        if name == "hidden":
+            return True
+        if name == "style":
+            value = m.group(2) or m.group(3) or m.group(4) or ""
+            if _style_hides(_unescape_charrefs(value)):
+                return True
+    return False
+
+
 def _font_has_breakout_attr(attr_slice: str) -> bool:
     if not attr_slice:
         return False
@@ -492,15 +581,23 @@ def html_to_text_bounded(
     *,
     max_chars: int | None = None,
     transform: Callable[[str], str] | None = None,
+    drop_hidden: bool = False,
+    report: dict | None = None,
 ) -> tuple[str, bool]:
     """Single-pass linear-time HTML -> plain text converter; never raises.
 
     When ``max_chars`` is given, stops assembling once ``max_chars`` output
     characters have been produced and returns ``(text, was_truncated)``.
+    With ``drop_hidden`` the text of elements hidden from the reader by
+    inline styles or the ``hidden`` attribute is left out; ``report``, when
+    given, receives ``hidden_chars`` (non-blank characters dropped).
     """
     if not html:
         return "", False
     s = html
+    hidden_tag: str | None = None  # the element whose subtree is hidden
+    hidden_depth = 0  # nesting of that tag name inside it
+    hidden_chars = 0
 
     limit = max(1, int(max_chars)) if max_chars is not None else None
     out_parts: list[str] = []
@@ -694,10 +791,13 @@ def html_to_text_bounded(
             emit_out(rendered)
 
     def append_piece(seg: str) -> None:
-        nonlocal link_raw_len
+        nonlocal link_raw_len, hidden_chars
         if "\x00" in seg:
             seg = seg.replace("\x00", "")
         if not seg or truncated:
+            return
+        if hidden_tag is not None:
+            hidden_chars += len(seg) - seg.count(" ") - seg.count("\n")
             return
         if in_link:
             link_raw.append(seg)
@@ -709,7 +809,7 @@ def html_to_text_bounded(
 
     def append_newline() -> None:
         nonlocal link_raw_len
-        if truncated:
+        if truncated or hidden_tag is not None:
             return
         if in_link:
             link_raw.append(" ")
@@ -860,6 +960,11 @@ def html_to_text_bounded(
                 if tm is None:
                     break
                 i = tm.end()
+            if hidden_tag is not None and end_tag == hidden_tag:
+                hidden_depth -= 1
+                if hidden_depth <= 0:
+                    hidden_tag, hidden_depth = None, 0
+                continue
             if end_tag in _FOREIGN_ROOTS:
                 if foreign_counts[end_tag] > 0:
                     while True:
@@ -923,6 +1028,33 @@ def html_to_text_bounded(
                 continue
             in_head = False
 
+        if drop_hidden and not raw_self_closing and tag not in _VOID_TAGS:
+            if hidden_tag is not None and tag == hidden_tag:
+                if tag in _SAME_NAME_IMPLIED_END and hidden_depth == 1:
+                    hidden_tag, hidden_depth = None, 0  # implied end tag
+                else:
+                    hidden_depth += 1
+            if (hidden_tag is None and not foreign_stack
+                    and _attrs_hide_content(attr_slice)):
+                spec = _RAWTEXT_SPECS.get(tag)
+                if spec is None:
+                    hidden_tag, hidden_depth = tag, 1
+                    continue
+                # A hidden raw-text element (textarea, title, ...): skip its
+                # content by its own end-tag rules, emitting nothing.
+                mode, end_re = spec
+                if mode == "script":
+                    next_i = scan_script_end(i)
+                elif end_re is not None:
+                    content_end, next_i = find_rawtext_end(end_re, i)
+                    hidden_chars += len("".join(s[i:content_end].split()))
+                else:
+                    next_i = None
+                if next_i is None:
+                    break
+                i = next_i
+                continue
+
         if tag in _FOREIGN_ROOTS:
             if not raw_self_closing:
                 foreign_stack.append(tag)
@@ -963,7 +1095,7 @@ def html_to_text_bounded(
             if truncated:
                 break
 
-        if tag == "a" and not (raw_self_closing and bool(foreign_stack)):
+        if tag == "a" and hidden_tag is None and not (raw_self_closing and bool(foreign_stack)):
             flush_link()
             if truncated:
                 break
@@ -977,6 +1109,8 @@ def html_to_text_bounded(
     result = "".join(out_parts)
     if truncated:
         result = result.rstrip("\n")
+    if report is not None:
+        report["hidden_chars"] = hidden_chars
     return result, truncated
 
 
@@ -992,3 +1126,17 @@ def html_to_text(html: str) -> str:
         return ""
     text, _ = html_to_text_bounded(html)
     return text
+
+
+def visible_text(html: str) -> tuple[str, int]:
+    """``(text the reader can see, non-blank characters hidden from them)``.
+
+    Mail bodies are normally read from Exchange's plain-text rendering, which
+    keeps text the sender hid with CSS. Callers that hold the HTML use this
+    when ``might_hide_text`` says there may be some.
+    """
+    if not html:
+        return "", 0
+    report: dict = {}
+    text, _ = html_to_text_bounded(html, drop_hidden=True, report=report)
+    return text, int(report.get("hidden_chars", 0))

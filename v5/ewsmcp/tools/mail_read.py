@@ -31,6 +31,7 @@ from exchangelib.attachments import FileAttachment, ItemAttachment
 from exchangelib.errors import UnauthorizedError
 
 from ..bodyclean import clean_body
+from ..content import guard
 from ..dates import parse_when
 from ..dto import (
     envelope,
@@ -145,6 +146,14 @@ def _row_card(ctx: Context, row: Any) -> Dict[str, Any]:
     return card
 
 
+def _guard_message(ctx: Context, message: Dict[str, Any]) -> Dict[str, Any]:
+    """Mark a full message's sender-written body (content.py)."""
+    body = message.get("body")
+    if isinstance(body, str):
+        message["body"] = guard(ctx, body, "message body")
+    return message
+
+
 def _row_full(ctx: Context, row: Any) -> Dict[str, Any]:
     full = _row_card(ctx, row)
     full.pop("snippet", None)
@@ -154,7 +163,7 @@ def _row_full(ctx: Context, row: Any) -> Dict[str, Any]:
         full["to"] = []
     body = _row_body(ctx, row)
     limit = int(ctx.settings.body_max_chars)
-    full["body"] = body[:limit]
+    full["body"] = guard(ctx, body[:limit], "message body")
     if len(body) > limit:
         full["body_truncated"] = True
     if row["internet_message_id"]:
@@ -1809,11 +1818,11 @@ async def _get_message(ctx: Context, id: str, format: Optional[str] = "full",
         return fetched, _sniff_item_smime(fetched)
 
     item, smime_by_idx = await ctx.gateway.call(work)
-    return _stamp({"ok": True, "message": msg_full(
+    return _stamp({"ok": True, "message": _guard_message(ctx, msg_full(
         item, ctx.aliaser, tz, ctx.settings.body_max_chars,
         include_html=bool(include_html),
         smime_types=smime_by_idx,
-    )}, "live")
+    ))}, "live")
 
 
 async def _get_messages(
@@ -2059,14 +2068,14 @@ async def _get_messages(
                     )
                 else:
                     built[orig_idx] = (
-                        msg_full(
+                        _guard_message(ctx, msg_full(
                             item,
                             ctx.aliaser,
                             tz,
                             ctx.settings.body_max_chars,
                             include_html=False,
                             smime_types=smime_by_idx,
-                        ),
+                        )),
                         "live",
                         None,
                     )
@@ -2128,7 +2137,7 @@ def _thread_from_cache(ctx: Context, raw_id: str, limit: int,
                                         internet_message_id=r["internet_message_id"]),
             "from": r["sender_email"] or "unknown",
             "date": r["date_iso"],
-            "body": _row_body(ctx, r)[:1500],
+            "body": guard(ctx, _row_body(ctx, r)[:1500], "message body"),
         }
         if r["has_attachments"]:
             entry["attach"] = True
@@ -2228,8 +2237,8 @@ async def _get_thread(ctx: Context, id: str, limit: int = 20,
                 ) if raw else None,
                 "from": _from(it) or "unknown",
                 "date": fmt_dt(getattr(it, "datetime_received", None), tz),
-                "body": clean_body(getattr(it, "text_body", None) or "",
-                                   max_chars=1500)["text"],
+                "body": guard(ctx, clean_body(getattr(it, "text_body", None) or "",
+                                              max_chars=1500)["text"], "message body"),
             }
             if getattr(it, "has_attachments", False):
                 entry["attach"] = True
@@ -2328,6 +2337,19 @@ async def _get_attachment(ctx: Context, message_id: str,
                           attachment: Optional[str] = None,
                           mode: str = "auto",
                           offset: int = 0) -> Dict[str, Any]:
+    """Every path out of the reader passes here, so attachment text — written
+    by whoever sent the file — is marked in one place (content.py)."""
+    out = await _read_attachment(ctx, message_id, attachment=attachment,
+                                 mode=mode, offset=offset)
+    if isinstance(out, dict) and out.get("mode") == "text" and isinstance(out.get("text"), str):
+        out["text"] = guard(ctx, out["text"], "attachment text")
+    return out
+
+
+async def _read_attachment(ctx: Context, message_id: str,
+                           attachment: Optional[str] = None,
+                           mode: str = "auto",
+                           offset: int = 0) -> Dict[str, Any]:
     if mode not in ("auto", "info", "text", "save"):
         raise ToolError(
             "validation",

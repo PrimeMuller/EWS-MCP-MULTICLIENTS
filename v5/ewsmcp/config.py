@@ -85,6 +85,10 @@ class Settings(BaseSettings):
     ews_attachment_dir: str = ""
     ews_max_attachment_mb: int = Field(default=25, ge=1, le=50)
     ews_keep_dumpable: bool = False
+    # Wrap message bodies, meeting descriptions and attachment text in
+    # nonce-marked <untrusted-content> blocks (content.py). Default: on in
+    # bearer mode, off in static mode.
+    ews_mark_untrusted_content: Optional[bool] = None
 
     # --- Serving ------------------------------------------------------------
     mcp_transport: Literal["stdio", "http"] = "stdio"
@@ -164,6 +168,8 @@ class Settings(BaseSettings):
             self.ews_cache_body_chars = 300 if bearer else 20_000
         if self.ews_mailbox_calls_per_minute is None:
             self.ews_mailbox_calls_per_minute = 60 if bearer else 0
+        if self.ews_mark_untrusted_content is None:
+            self.ews_mark_untrusted_content = bearer
         if not bearer:
             if not (self.ews_email or "").strip():
                 raise ValueError("EWS_EMAIL is required when EWS_AUTH_MODE=static.")

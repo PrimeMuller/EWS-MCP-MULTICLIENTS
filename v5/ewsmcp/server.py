@@ -12,6 +12,7 @@ from .audit import AuditLog, mailbox_audit
 from .cache import CacheStore, SyncEngine, SyncLease, WindowSync
 from .cache.lease import DEFAULT_RETRY_SECONDS, LOCK_FILENAME
 from .config import Settings
+from .content import UNTRUSTED_NOTICE
 from .gateway.client import EWSGateway
 from .gateway.connection import ConnectionManager
 from .identity import SCOPE_KEY, Principal, use_principal
@@ -370,8 +371,18 @@ async def stop_connection_manager(ctx: Context) -> None:
         ctx.lease.release()
 
 
+SERVER_INSTRUCTIONS = (
+    "This server reads and acts on one Exchange mailbox per caller. "
+    + UNTRUSTED_NOTICE
+    + " Text hidden from the human reader is removed and reported as "
+    "hidden_text_removed. Sending mail, deleting, and changing meetings or "
+    "rules need a confirm_token from a preview: show the preview to the user "
+    "and continue only on their explicit approval."
+)
+
+
 def build_mcp_server(ctx: Context) -> Server:
-    server = Server("ews-mcp-v5")
+    server = Server("ews-mcp-v5", instructions=SERVER_INSTRUCTIONS)
 
     @server.list_tools()
     async def list_tools() -> List[Tool]:

@@ -2,10 +2,16 @@
 ``id`` IS the short alias; the aliaser holds the raw id + changekey."""
 
 from datetime import date, datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo
 
-from .bodyclean import clean_body, html_to_text, strip_quoted_history
+from .bodyclean import (
+    clean_body,
+    html_to_text,
+    might_hide_text,
+    strip_quoted_history,
+    visible_text,
+)
 from .ids import IdAliaser
 
 
@@ -99,6 +105,23 @@ def sniff_smime_type(name: Optional[str], content_type: Optional[str],
     return None
 
 
+def reader_visible_body(text_body: str, raw_html: str) -> Tuple[str, bool]:
+    """The body as its human reader sees it: ``(text, hidden_text_removed)``.
+
+    Exchange's plain-text rendering keeps text the sender hid with CSS — the
+    usual carrier for instructions aimed at an AI assistant. When the HTML
+    shows signs of hidden content, the body is rebuilt from the HTML without
+    it; otherwise Exchange's text is used as before.
+    """
+    if raw_html and might_hide_text(raw_html):
+        visible, hidden_chars = visible_text(raw_html)
+        if hidden_chars:
+            return visible, True
+    if not text_body and raw_html:
+        return html_to_text(raw_html), False
+    return text_body, False
+
+
 def msg_card(item: Any, aliaser: IdAliaser, tz: str) -> Dict[str, Any]:
     """MsgCard: the ≤~60-token search/list unit."""
     text = getattr(item, "text_body", None) or ""
@@ -144,15 +167,16 @@ def msg_full(item: Any, aliaser: IdAliaser, tz: str, body_max_chars: int,
     cc = _emails(getattr(item, "cc_recipients", None))
     if cc:
         full["cc"] = cc
-    source = getattr(item, "text_body", None) or ""
     raw_html = ""
     body_obj = getattr(item, "body", None)
     if body_obj is not None:
         raw_html = str(body_obj)
-    if not source and raw_html:
-        source = html_to_text(raw_html)
+    source, hidden_removed = reader_visible_body(
+        getattr(item, "text_body", None) or "", raw_html)
     cleaned = clean_body(source, max_chars=body_max_chars)
     full["body"] = cleaned["text"]
+    if hidden_removed:
+        full["hidden_text_removed"] = True
     if cleaned["quoted_blocks_stripped"]:
         full["quoted_history"] = (
             f"stripped {cleaned['quoted_blocks_stripped']} quoted block(s) — "

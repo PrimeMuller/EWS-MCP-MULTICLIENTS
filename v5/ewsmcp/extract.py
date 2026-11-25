@@ -2242,13 +2242,20 @@ def _decode_text_bytes(data: bytes, *, sniff_html_meta: bool = False) -> str:
 def _html_to_text_bounded(
     html: str, *, max_chars: int = MAX_EXTRACTED_CHARS
 ) -> Tuple[str, bool]:
-    """Single-pass O(n) HTML -> plain text converter shared with ``bodyclean``."""
+    """Single-pass O(n) HTML -> plain text converter shared with ``bodyclean``.
+
+    Text hidden from a human reader (inline display:none, the hidden
+    attribute, zero-size fonts, ...) is left out: an attached document or
+    message must not smuggle instructions to the model that its reader never
+    sees.
+    """
     if not html:
         return "", False
     text_out, truncated = html_to_text_bounded(
         html,
         max_chars=max(1, int(max_chars)),
         transform=normalize_arabic_presentation_forms,
+        drop_hidden=True,
     )
     return sanitize_surrogates(text_out), truncated
 

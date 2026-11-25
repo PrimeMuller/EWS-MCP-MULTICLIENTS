@@ -35,8 +35,9 @@ from exchangelib.recurrence import (
 
 from .. import __version__
 from ..bodyclean import clean_body, html_to_text
+from ..content import guard
 from ..dates import parse_when
-from ..dto import envelope, event_card, fmt_dt
+from ..dto import envelope, event_card, fmt_dt, reader_visible_body
 from ..errors import ToolError
 from ..extract_worker import EXTRACT_MEMORY_LIMIT_MB, memory_ceiling_supported
 from .base import Context, ToolSpec
@@ -237,12 +238,14 @@ async def _get_event(ctx: Context, id: str) -> Dict[str, Any]:
     item, rule = await ctx.gateway.call(work)
     event = event_card(item, ctx.aliaser, tz)
     event["attendees"] = _attendee_entries(item)
-    source = getattr(item, "text_body", None) or ""
-    if not source:
-        body_obj = getattr(item, "body", None)
-        if body_obj is not None:
-            source = html_to_text(str(body_obj))
-    event["body"] = clean_body(source, max_chars=2000)["text"]
+    body_obj = getattr(item, "body", None)
+    source, hidden_removed = reader_visible_body(
+        getattr(item, "text_body", None) or "",
+        str(body_obj) if body_obj is not None else "")
+    event["body"] = guard(ctx, clean_body(source, max_chars=2000)["text"],
+                          "meeting description")
+    if hidden_removed:
+        event["hidden_text_removed"] = True
     event["recurring"] = bool(getattr(item, "is_recurring", False)
                               or getattr(item, "recurrence", None))
     if rule is not None:
