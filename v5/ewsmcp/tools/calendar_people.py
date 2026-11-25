@@ -567,9 +567,15 @@ async def _get_server_status(ctx: Context) -> Dict[str, Any]:
             "The memory ceiling for documents is not enforced on this platform."
         )
     now = time.time()
-    connection: Dict[str, Any] = (
-        dict(ctx.manager.status()) if ctx.manager else {"state": "unmanaged"}
-    )
+    if ctx.pool is not None:
+        # Bearer mode: the server holds no Exchange credentials of its own,
+        # so there is no single connection to report — only aggregates,
+        # never which mailboxes are active.
+        connection: Dict[str, Any] = {"state": "per_mailbox", **ctx.pool.stats()}
+    elif ctx.manager:
+        connection = dict(ctx.manager.status())
+    else:
+        connection = {"state": "unmanaged"}
     if ctx._circuit_open_until > now:
         connection["circuit_open"] = True
         connection["retry_after_s"] = int(ctx._circuit_open_until - now)
@@ -758,5 +764,6 @@ TOOLS: List[ToolSpec] = [
         },
         handler=_get_server_status,
         requires_ews=False,
+        mailbox_scoped=False,
     ),
 ]

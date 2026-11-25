@@ -281,3 +281,28 @@ def test_close_releases_every_session():
     lease = run(scenario())
     assert lease.session.closed and lease.gateway.closed
     assert h.pool.sessions() == []
+
+
+def test_unproven_token_never_opens_the_mailboxs_stored_state():
+    """A forged token naming someone's mailbox fails the proof before the
+    mailbox's alias store, audit chain or mirror is even opened."""
+    h = Harness(outcome="rejected")
+    with pytest.raises(ToolError):
+        run(h.pool.checkout(bearer("victim@corp.example", fp="forged")))
+    assert h.parts == {}  # parts_factory never ran
+    session = h.pool.get("victim@corp.example")
+    with pytest.raises(RuntimeError):
+        _ = session.aliaser  # no stored state behind an unproven session
+
+
+def test_stored_state_is_opened_once_after_the_first_proof():
+    h = Harness()
+
+    async def scenario():
+        leases = await asyncio.gather(*(
+            h.pool.checkout(bearer("a@corp.example", fp=f"t{i}")) for i in range(3)))
+        return leases
+
+    leases = run(scenario())
+    assert list(h.parts) == ["a@corp.example"]  # one factory call for 3 tokens
+    assert leases[0].session.aliaser == f"aliases:{mailbox_key('a@corp.example')}"

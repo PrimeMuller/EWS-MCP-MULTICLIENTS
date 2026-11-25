@@ -972,7 +972,7 @@ async def _create_draft(ctx: Context, *, body: str, mode: str = "new",
             final_subject = subject or _prefixed("Re: ", getattr(original, "subject", None))
             reply = original.create_reply_all(final_subject, html_body)
             reply_all_to, reply_all_cc = _merge_reply_all_recipients(
-                reply, ctx.settings.ews_email, to, cc, bcc
+                reply, ctx.mailbox, to, cc, bcc
             )
         else:  # forward — create_forward REQUIRES to_recipients (5.0.3)
             final_subject = subject or _prefixed("Fwd: ", getattr(original, "subject", None))
@@ -2028,7 +2028,14 @@ async def _send_draft_preview(ctx: Context, kwargs: Dict[str, Any]) -> Dict[str,
     return content
 
 
-def _send_confirm_needed(kwargs: Dict[str, Any]) -> bool:
+def _idempotency_scope(ctx: Any, key: str) -> str:
+    """Receipts are per mailbox: two users who pick the same key (say
+    "send-1") must never see each other's receipt or block each other."""
+    mailbox = (getattr(ctx, "mailbox", "") or "").lower()
+    return f"{mailbox}\x1f{key}"
+
+
+def _send_confirm_needed(kwargs: Dict[str, Any], ctx: Any = None) -> bool:
     """Skip the confirm gate on an idempotent REPLAY (v3.5 semantics).
 
     A retry with the same idempotency_key + draft_id returns the cached
@@ -2039,7 +2046,7 @@ def _send_confirm_needed(kwargs: Dict[str, Any]) -> bool:
     """
     key = kwargs.get("idempotency_key")
     if isinstance(key, str) and key:
-        prior = _idempotency_get(key)
+        prior = _idempotency_get(_idempotency_scope(ctx, key))
         if prior is not None and prior.get("draft_id") == kwargs.get("draft_id"):
             return False
     return True
@@ -2059,7 +2066,7 @@ async def _send_draft(
     _verified_content_hash: Optional[str] = None,
 ) -> Dict[str, Any]:
     if idempotency_key:
-        prior = _idempotency_get(idempotency_key)
+        prior = _idempotency_get(_idempotency_scope(ctx, idempotency_key))
         if prior is not None:
             if prior["draft_id"] != draft_id:
                 raise ToolError(
@@ -2096,9 +2103,9 @@ async def _send_draft(
     async with _draft_lock(draft_id):
         result = await ctx.gateway.call(work)
     if idempotency_key:
-        _idempotency_put(idempotency_key, {"draft_id": draft_id,
-                                           "result": dict(result),
-                                           "ts": time.time()})
+        _idempotency_put(_idempotency_scope(ctx, idempotency_key),
+                         {"draft_id": draft_id, "result": dict(result),
+                          "ts": time.time()})
     return result
 
 
@@ -2255,7 +2262,7 @@ def _account_smtp_addresses(
 ) -> set[str]:
     eff_account = account if account is not None else getattr(item, "account", None)
     candidates = [
-        getattr(ctx.settings, "ews_email", None),
+        ctx.mailbox,
         getattr(eff_account, "primary_smtp_address", None),
         getattr(getattr(eff_account, "identity", None), "primary_smtp_address", None),
     ]

@@ -578,10 +578,16 @@ def _read_attachment_item(att: Any) -> Any:
 
 
 def _text_cache(ctx: Context) -> AttachmentTextCache:
-    cache = getattr(ctx, "_attachment_text_cache", None)
+    """Extracted attachment text, kept per mailbox: when the call is bound to
+    a mailbox session the cache lives there, so a document read by one
+    person is never served to another (attachment ids are not secrets)."""
+    session = getattr(ctx, "session", None)
+    holder, attr = ((session, "text_cache") if session is not None
+                    else (ctx, "_attachment_text_cache"))
+    cache = getattr(holder, attr, None)
     if not isinstance(cache, AttachmentTextCache):
         cache = AttachmentTextCache()
-        setattr(ctx, "_attachment_text_cache", cache)
+        setattr(holder, attr, cache)
     return cache
 
 

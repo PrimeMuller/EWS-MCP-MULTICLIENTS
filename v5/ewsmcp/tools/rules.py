@@ -135,15 +135,17 @@ class _RuleLockState:
     )
 
 
-_RULE_LOCK_STATE = _RuleLockState()
+# One lock per mailbox: a mailbox's rule set is one server-side list, so its
+# writes serialise; different mailboxes never wait on each other. Entries are
+# dropped as soon as nobody holds or waits for them.
+_RULE_LOCK_STATES: Dict[str, _RuleLockState] = {}
 _RULE_LOCK_GUARD = threading.Lock()
 
 
 def reset_rules_lock() -> None:
     """Tests only."""
-    global _RULE_LOCK_STATE
     with _RULE_LOCK_GUARD:
-        _RULE_LOCK_STATE = _RuleLockState()
+        _RULE_LOCK_STATES.clear()
 
 
 def _wake_rule_waiter(fut: asyncio.Future[None]) -> None:
@@ -151,7 +153,7 @@ def _wake_rule_waiter(fut: asyncio.Future[None]) -> None:
         fut.set_result(None)
 
 
-def _handoff_rule_lock(state: _RuleLockState) -> None:
+def _handoff_rule_lock(key: str, state: _RuleLockState) -> None:
     try:
         running = asyncio.get_running_loop()
     except RuntimeError:
@@ -169,16 +171,21 @@ def _handoff_rule_lock(state: _RuleLockState) -> None:
         except RuntimeError:
             continue
     state.locked = False
+    if _RULE_LOCK_STATES.get(key) is state:
+        del _RULE_LOCK_STATES[key]
 
 
 @asynccontextmanager
-async def _rules_lock():
-    """Serialise ``save_rule`` and ``delete_rule`` mutations in-process."""
+async def _rules_lock(mailbox: str = ""):
+    """Serialise one mailbox's ``save_rule`` / ``delete_rule`` in-process."""
+    key = (mailbox or "").strip().lower()
     loop = asyncio.get_running_loop()
     waiter: Optional[asyncio.Future[None]] = None
     with _RULE_LOCK_GUARD:
-        state = _RULE_LOCK_STATE
-        if not state.locked and not state.waiters:
+        state = _RULE_LOCK_STATES.get(key)
+        if state is None:
+            state = _RULE_LOCK_STATES[key] = _RuleLockState(locked=True)
+        elif not state.locked and not state.waiters:
             state.locked = True
         else:
             waiter = loop.create_future()
@@ -189,21 +196,21 @@ async def _rules_lock():
             await waiter
         except BaseException:
             with _RULE_LOCK_GUARD:
-                if _RULE_LOCK_STATE is state:
+                if _RULE_LOCK_STATES.get(key) is state:
                     try:
                         state.waiters.remove((loop, waiter))
                     except ValueError:
                         pass
                     if waiter.done() and not waiter.cancelled():
-                        _handoff_rule_lock(state)
+                        _handoff_rule_lock(key, state)
             raise
 
     try:
         yield
     finally:
         with _RULE_LOCK_GUARD:
-            if _RULE_LOCK_STATE is state:
-                _handoff_rule_lock(state)
+            if _RULE_LOCK_STATES.get(key) is state:
+                _handoff_rule_lock(key, state)
 
 
 # --- validation & normalization helpers --------------------------------------
@@ -1185,7 +1192,7 @@ async def _save_rule(
             "replaced": raw_rule_id is not None,
         }
 
-    async with _rules_lock():
+    async with _rules_lock(ctx.mailbox):
         return await ctx.gateway.call(work)
 
 
@@ -1250,7 +1257,7 @@ async def _delete_rule(
             "name": deleted_name,
         }
 
-    async with _rules_lock():
+    async with _rules_lock(ctx.mailbox):
         return await ctx.gateway.call(work)
 
 

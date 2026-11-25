@@ -1,19 +1,26 @@
 """ToolSpec + the dispatcher: every gate from DESIGN.md §Safety in one chain.
 
 Gate order (policy before connectivity, nothing irreversible without two
-model decisions): kill-switch → tier → circuit → cold / auth gate → recipient
-guard (argument-borne recipients on EVERY tool, resolved recipients via
-the preview hook) → two-phase confirm (content-bound + single-use when
-the spec supplies a preview hook) → send rate cap → alias resolution →
-handler (on the EWS pool) → audit.
+model decisions): kill-switch → tier → mailbox binding (bearer mode: the
+caller's token proven, the call bound to ITS mailbox session) → circuit →
+cold / auth gate → recipient guard (argument-borne recipients on EVERY
+tool, resolved recipients via the preview hook) → two-phase confirm
+(content-bound + single-use when the spec supplies a preview hook) → send
+rate cap → alias resolution → handler (on the EWS pool) → audit.
+
+Handlers never take a mailbox argument: they receive a context already
+bound to one mailbox (``ctx.mailbox``, ``ctx.gateway``, ``ctx.aliaser``,
+``ctx.cache``, ``ctx.audit`` all belong to it).
 """
 
 import asyncio
+import dataclasses
 import fnmatch
 import inspect
 import threading
 import time
 from collections import deque
+from contextlib import AsyncExitStack
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Union
 
@@ -25,6 +32,8 @@ from ..confirm import (
     verify_token,
 )
 from ..errors import AUTH_FAILED_HINT, ToolError, map_exception
+from ..identity import current_principal
+from ..sessions import CircuitState
 
 TIER_RANK = {"read": 0, "draft": 1, "full": 2}
 CLASS_TIER = {"read": "read", "write": "draft", "send": "full", "destructive": "full"}
@@ -53,6 +62,17 @@ def reset_send_rate_window() -> None:
         _SEND_TIMES.clear()
 
 
+def _positional_arity(fn: Callable[..., Any]) -> int:
+    try:
+        params = inspect.signature(fn).parameters.values()
+    except (TypeError, ValueError):
+        return 1
+    return sum(
+        1 for p in params
+        if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)
+    )
+
+
 @dataclass
 class ToolSpec:
     name: str
@@ -79,9 +99,19 @@ class ToolSpec:
     ] = None
     kill_switch_hint: Optional[str] = None
     resolve_ids: bool = True
+    # False only for tools that report on the server itself and touch no
+    # mailbox (get_server_status): in bearer mode they are not bound to one.
+    mailbox_scoped: bool = True
 
-    def confirm_needed(self, kwargs: Dict[str, Any]) -> bool:
-        return self.confirm(kwargs) if callable(self.confirm) else bool(self.confirm)
+    def confirm_needed(self, kwargs: Dict[str, Any], ctx: Any = None) -> bool:
+        """``confirm`` may be a bool, ``predicate(kwargs)``, or
+        ``predicate(kwargs, ctx)`` when the answer depends on the bound
+        mailbox (send_draft's idempotent replays are per mailbox)."""
+        if not callable(self.confirm):
+            return bool(self.confirm)
+        if _positional_arity(self.confirm) >= 2:
+            return bool(self.confirm(kwargs, ctx))
+        return bool(self.confirm(kwargs))
 
     def sends_mail(
         self, kwargs: Dict[str, Any], content: Optional[Dict[str, Any]] = None
@@ -104,6 +134,15 @@ class ToolSpec:
 
 @dataclass
 class Context:
+    """What a handler works with.
+
+    In static mode one Context serves the single configured mailbox. In
+    bearer mode the process-wide Context holds the session ``pool`` and
+    :meth:`bind` derives, per call, a Context whose gateway, aliases,
+    mirror, audit chain and circuit all belong to the caller's mailbox.
+    ``registry``, ``counters`` and ``started_at`` are shared by reference.
+    """
+
     settings: Any
     gateway: Any
     manager: Any  # ConnectionManager | None
@@ -116,11 +155,51 @@ class Context:
     registry: Dict[str, ToolSpec] = field(default_factory=dict)
     started_at: float = field(default_factory=time.time)
     counters: Dict[str, int] = field(default_factory=dict)
-    _circuit_failures: int = 0
-    _circuit_open_until: float = 0.0
+    mailbox: str = ""  # the mailbox this context acts on ("" = not bound)
+    pool: Any = None  # SessionPool (bearer mode)
+    session: Any = None  # MailboxSession this context is bound to
+    circuit: CircuitState = field(default_factory=CircuitState)
+
+    def __post_init__(self) -> None:
+        if not self.mailbox and self.pool is None:
+            self.mailbox = getattr(self.settings, "ews_email", None) or ""
+
+    @property
+    def _circuit_failures(self) -> int:
+        return self.circuit.failures
+
+    @_circuit_failures.setter
+    def _circuit_failures(self, value: int) -> None:
+        self.circuit.failures = value
+
+    @property
+    def _circuit_open_until(self) -> float:
+        return self.circuit.open_until
+
+    @_circuit_open_until.setter
+    def _circuit_open_until(self, value: float) -> None:
+        self.circuit.open_until = value
 
     def bump(self, key: str) -> None:
         self.counters[key] = self.counters.get(key, 0) + 1
+
+    def bind(self, lease: Any) -> "Context":
+        """A per-call Context acting on ``lease``'s mailbox and nothing else."""
+        session = lease.session
+        return dataclasses.replace(
+            self,
+            gateway=lease.gateway,
+            manager=None,
+            aliaser=session.aliaser,
+            audit=session.audit,
+            cache=session.cache,
+            sync=session.syncer,
+            lease=None,
+            semantic=None,
+            mailbox=session.mailbox,
+            session=session,
+            circuit=session.circuit,
+        )
 
 
 def _split(raw: str) -> List[str]:
@@ -266,7 +345,7 @@ def _rate_guard(ctx: Context) -> None:
 
 
 def _external_recipients(ctx: Context, source: Dict[str, Any]) -> List[str]:
-    own = ctx.settings.ews_email.rsplit("@", 1)[-1].lower()
+    own = ctx.mailbox.rsplit("@", 1)[-1].lower()
     return sorted({
         r for r in _recipients(source) if r.rsplit("@", 1)[-1] != own
     })
@@ -333,7 +412,7 @@ async def _confirm_gate(ctx: Context, spec: ToolSpec, kwargs: Dict[str, Any],
         target_id = "-"
     if not token:
         tok = make_token(
-            mailbox=ctx.settings.ews_email, action=spec.name, target_id=target_id,
+            mailbox=ctx.mailbox, action=spec.name, target_id=target_id,
             chash=chash, ttl_seconds=ctx.settings.confirm_ttl_seconds, secret=secret,
         )
         if content is not None:
@@ -362,7 +441,7 @@ async def _confirm_gate(ctx: Context, spec: ToolSpec, kwargs: Dict[str, Any],
             response["warnings"] = [f"external recipients: {', '.join(external)}"]
         return response
     ok, reason = verify_token(
-        token, mailbox=ctx.settings.ews_email, action=spec.name,
+        token, mailbox=ctx.mailbox, action=spec.name,
         target_id=target_id, chash=chash, secret=secret,
     )
     if not ok:
@@ -413,7 +492,7 @@ async def mint_token(ctx: Context, spec: ToolSpec, kwargs: Dict[str, Any]) -> st
         chash = content_hash(dict(clean))
         target_id = "-"
     return make_token(
-        mailbox=ctx.settings.ews_email, action=spec.name, target_id=target_id,
+        mailbox=ctx.mailbox, action=spec.name, target_id=target_id,
         chash=chash,
         ttl_seconds=ctx.settings.confirm_ttl_seconds,
         secret=ctx.settings.send_confirm_secret,
@@ -445,6 +524,7 @@ async def dispatch(ctx: Context, spec: ToolSpec, kwargs: Dict[str, Any],
     kwargs = dict(kwargs)
     confirm_token = kwargs.pop("confirm_token", None)
     kwargs.pop(VERIFIED_CONTENT_HASH_ARG, None)
+    binding = AsyncExitStack()
     try:
         # Kill-switch (policy precedes connectivity)
         if spec.sends_mail(kwargs):
@@ -457,6 +537,12 @@ async def dispatch(ctx: Context, spec: ToolSpec, kwargs: Dict[str, Any],
                 "tier_blocked",
                 f"{spec.name} needs capability tier '{need}'; server runs '{tier}'.",
             )
+        # Mailbox binding (bearer mode): prove the caller's token, then act
+        # on ITS mailbox only. From here on ``ctx`` is the bound context, so
+        # every later gate, the handler, and the audit record belong to it.
+        if ctx.pool is not None and ctx.session is None and spec.mailbox_scoped:
+            lease = await binding.enter_async_context(ctx.pool.bind(current_principal()))
+            ctx = ctx.bind(lease)
         # Circuit breaker
         now = time.time()
         if spec.requires_ews and ctx._circuit_open_until > now:
@@ -501,7 +587,7 @@ async def dispatch(ctx: Context, spec: ToolSpec, kwargs: Dict[str, Any],
         _recipient_guard(ctx, kwargs)
         # Two-phase confirm (content-bound via spec.preview when present,
         # otherwise the caller's literal args; single-use either way)
-        if spec.confirm_needed(kwargs):
+        if spec.confirm_needed(kwargs, ctx):
             phase1 = await _confirm_gate(ctx, spec, kwargs, confirm_token)
             if phase1 is not None:
                 outcome = "phase1"
@@ -556,3 +642,4 @@ async def dispatch(ctx: Context, spec: ToolSpec, kwargs: Dict[str, Any],
             outcome=outcome, latency_ms=int((time.time() - start) * 1000),
             transport=transport, detail=detail,
         )
+        await binding.aclose()  # releases the mailbox session, if bound

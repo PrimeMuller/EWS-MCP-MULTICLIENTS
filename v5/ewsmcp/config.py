@@ -17,9 +17,19 @@ class Settings(BaseSettings):
         env_file=".env", env_file_encoding="utf-8", case_sensitive=False, extra="ignore"
     )
 
+    # --- Who the server acts for ---------------------------------------------
+    # static: one mailbox, the configured EWS_EMAIL / EWS_USERNAME /
+    #   EWS_PASSWORD (single user; stdio or HTTP).
+    # bearer: many mailboxes. Every HTTP request carries the caller's own EWS
+    #   OAuth2 access token (Authorization: Bearer); the mailbox comes from
+    #   its claims (EWS_TOKEN_MAILBOX_CLAIMS) and Exchange checks the token.
+    #   No token -> HTTP 401. The server holds no Exchange credentials.
+    ews_auth_mode: Literal["static", "bearer"] = "static"
+    ews_token_mailbox_claims: str = "email,upn,preferred_username,unique_name"
+
     # --- Exchange upstream -------------------------------------------------
     ews_server_url: str
-    ews_email: str
+    ews_email: Optional[str] = None  # required in static mode
     ews_username: Optional[str] = None
     ews_password: Optional[str] = None
     # Auto-negotiation is the default because it adapts to what the server
@@ -37,8 +47,8 @@ class Settings(BaseSettings):
     ews_auth_failure_cooldown_seconds: int = Field(default=900, ge=60)
     ews_auth_max_rejections: int = Field(default=3, ge=1, le=10)
     # Worker threads for Exchange calls: the process-wide cap on requests in
-    # flight across every mailbox.
-    ews_max_concurrency: int = 4
+    # flight across every mailbox (default 4 in static mode, 32 in bearer).
+    ews_max_concurrency: Optional[int] = Field(default=None, ge=1, le=512)
     # Requests ONE mailbox may have in flight (its share of the pool and its
     # exchangelib connection count). Exchange's own per-user EWS limit is far
     # higher; staying at 2-3 keeps a single busy assistant a polite guest.
@@ -75,7 +85,9 @@ class Settings(BaseSettings):
     data_dir_allow_synced: bool = False  # explicit opt-out of the synced-path guard
 
     # --- Cache mirror (cache-first reads; false = pure EWS, fully functional)
-    ews_cache_enabled: bool = True
+    # Default: on in static mode, off in bearer mode (live reads; Exchange's
+    # own search index already covers every mailbox).
+    ews_cache_enabled: Optional[bool] = None
     ews_cache_folders: str = "inbox,sent"
     ews_cache_sync_seconds: int = 45
     ews_cache_hierarchy_seconds: int = 600
@@ -99,6 +111,39 @@ class Settings(BaseSettings):
             stripped = value.strip().lower()
             return stripped or None
         return value
+
+    @property
+    def bearer_mode(self) -> bool:
+        return self.ews_auth_mode == "bearer"
+
+    @model_validator(mode="after")
+    def _resolve_mode(self) -> "Settings":
+        """Fill mode-dependent defaults and refuse combinations that would
+        mix mailboxes or cannot work."""
+        bearer = self.ews_auth_mode == "bearer"
+        if self.ews_max_concurrency is None:
+            self.ews_max_concurrency = 32 if bearer else 4
+        if self.ews_cache_enabled is None:
+            self.ews_cache_enabled = not bearer
+        if not bearer:
+            if not (self.ews_email or "").strip():
+                raise ValueError("EWS_EMAIL is required when EWS_AUTH_MODE=static.")
+            return self
+        if self.mcp_transport != "http":
+            raise ValueError(
+                "EWS_AUTH_MODE=bearer serves many users over HTTP; set MCP_TRANSPORT=http."
+            )
+        if self.ews_semantic_index != "none":
+            raise ValueError(
+                "EWS_SEMANTIC_INDEX is single-mailbox (its index has no mailbox "
+                "column) and would mix users' mail in bearer mode; set it to none."
+            )
+        if self.ews_cache_enabled:
+            raise ValueError(
+                "The background mirror polls one mailbox; it is not available in "
+                "bearer mode. Set EWS_CACHE_ENABLED=false."
+            )
+        return self
 
     @model_validator(mode="after")
     def _resolve_data_dir(self) -> "Settings":

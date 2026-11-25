@@ -174,6 +174,12 @@ def principal_from_bearer(
 
 # --- request scope -----------------------------------------------------------
 
+# ASGI scope key under which the HTTP layer leaves the parsed principal. The
+# MCP SDK runs stateless tool calls in a task it started at boot, so a
+# ContextVar set by the HTTP handler does not reach them; the request scope
+# (``request_context.request.scope``) does.
+SCOPE_KEY = "ewsmcp.principal"
+
 # Set by the transports for the duration of one tool call; read by the
 # dispatcher to bind the call to its mailbox session.
 CURRENT_PRINCIPAL: ContextVar[Optional[Principal]] = ContextVar(

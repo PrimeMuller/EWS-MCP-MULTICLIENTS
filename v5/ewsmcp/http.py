@@ -10,13 +10,30 @@ from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 
 from . import __version__
 from .errors import HTTP_BY_CODE
-from .server import build_context, build_mcp_server, start_connection_manager
+from .identity import (
+    SCOPE_KEY,
+    BearerError,
+    Principal,
+    bearer_token_from_headers,
+    parse_claim_order,
+    principal_from_bearer,
+    use_principal,
+)
+from .server import (
+    build_context,
+    build_mcp_server,
+    start_connection_manager,
+    stop_connection_manager,
+)
 from .tools.base import dispatch
 from .tools.writes import max_attachment_bytes
 
 logger = logging.getLogger(__name__)
 
 PUBLIC_PATHS = {"/health", "/livez", "/readyz", "/version"}
+# RFC 6750 challenge on every bearer-mode 401. No error_description: the
+# reason is in the JSON body, and the header never echoes token content.
+BEARER_CHALLENGE = (b"www-authenticate", b'Bearer realm="ews-mcp", error="invalid_token"')
 
 
 def max_body_bytes(settings: Any) -> int:
@@ -35,13 +52,15 @@ def _validator_for(spec) -> Any:
     return v
 
 
-def _authorized(headers, api_key: str) -> bool:
+def _authorized(headers, api_key: str, *, allow_bearer: bool = True) -> bool:
+    """API-key check. In bearer mode the Authorization header carries the
+    caller's EWS token, so the key is accepted only as ``X-API-Key``."""
     expected = api_key.encode()
     for name, value in headers or []:
         lname = name.lower() if isinstance(name, bytes) else str(name).encode().lower()
         raw = value.decode("utf-8", "replace") if isinstance(value, bytes) else str(value)
         if lname == b"authorization" and raw.lower().startswith("bearer "):
-            if hmac.compare_digest(raw[7:].strip().encode(), expected):
+            if allow_bearer and hmac.compare_digest(raw[7:].strip().encode(), expected):
                 return True
         elif lname == b"x-api-key":
             if hmac.compare_digest(raw.strip().encode(), expected):
@@ -49,13 +68,34 @@ def _authorized(headers, api_key: str) -> bool:
     return False
 
 
-async def _send_json(send, status: int, payload: Dict[str, Any]) -> None:
+def _principal_for(headers, claims) -> "tuple[Optional[Principal], str]":
+    token = bearer_token_from_headers(headers)
+    if token is None:
+        return None, "missing bearer token"
+    try:
+        return principal_from_bearer(token, claims=claims), ""
+    except BearerError as exc:
+        return None, f"bearer token not usable ({exc.reason})"
+
+
+async def _send_json(send, status: int, payload: Dict[str, Any],
+                     extra_headers: Optional[list] = None) -> None:
     body = json.dumps(payload, ensure_ascii=False, default=str).encode()
-    await send({"type": "http.response.start", "status": status, "headers": [
+    headers = [
         [b"content-type", b"application/json"],
         [b"content-length", str(len(body)).encode()],
-    ]})
+    ]
+    for name, value in extra_headers or ():
+        headers.append([name, value])
+    await send({"type": "http.response.start", "status": status, "headers": headers})
     await send({"type": "http.response.body", "body": body})
+
+
+async def _send_bearer_401(send, message: str) -> None:
+    await _send_json(send, 401, {"ok": False, "error": {
+        "code": "auth_failed", "message": message,
+        "hint": "Send the user's EWS access token as 'Authorization: Bearer <token>'.",
+    }}, extra_headers=[BEARER_CHALLENGE])
 
 
 def _metrics_text(ctx) -> str:
@@ -163,6 +203,8 @@ def build_app(ctx, settings, streamable: Optional[Any] = None):
     """ASGI app closure — separated from serve_http so tests can drive it."""
     api_key = settings.mcp_api_key or ""
     body_limit = max_body_bytes(settings)
+    bearer = bool(getattr(settings, "bearer_mode", False))
+    claims = parse_claim_order(getattr(settings, "ews_token_mailbox_claims", ""))
 
     async def app(scope, receive, send):
         if scope["type"] == "lifespan":
@@ -172,6 +214,7 @@ def build_app(ctx, settings, streamable: Optional[Any] = None):
                     await start_connection_manager(ctx)
                     await send({"type": "lifespan.startup.complete"})
                 elif message["type"] == "lifespan.shutdown":
+                    await stop_connection_manager(ctx)
                     await send({"type": "lifespan.shutdown.complete"})
                     return
         if scope["type"] != "http":
@@ -185,9 +228,14 @@ def build_app(ctx, settings, streamable: Optional[Any] = None):
         if path == "/version" and method == "GET":
             return await _send_json(send, 200, {"version": __version__})
         if path == "/readyz" and method == "GET":
-            conn = ctx.manager.status() if ctx.manager else {"state": "unmanaged"}
+            if ctx.pool is not None:
+                # Bearer mode holds no credentials of its own, so Exchange
+                # cannot be probed here; mailboxes connect per caller.
+                conn = {"state": "per_mailbox", **ctx.pool.stats()}
+            else:
+                conn = ctx.manager.status() if ctx.manager else {"state": "unmanaged"}
             cstate = conn.get("state")
-            warm = cstate in ("warm", "unmanaged")
+            warm = cstate in ("warm", "unmanaged", "per_mailbox")
             ready_status = (
                 "ok"
                 if warm
@@ -207,9 +255,21 @@ def build_app(ctx, settings, streamable: Optional[Any] = None):
             return await _send_json(send, 404, {"ok": False, "error": {
                 "code": "validation", "message": "not found"}})
 
-        if api_key and not _authorized(scope.get("headers"), api_key):
+        if api_key and not _authorized(scope.get("headers"), api_key, allow_bearer=not bearer):
             return await _send_json(send, 401, {"ok": False, "error": {
-                "code": "auth_failed", "message": "missing or invalid bearer token"}})
+                "code": "auth_failed",
+                "message": ("missing or invalid X-API-Key" if bearer
+                            else "missing or invalid bearer token")}})
+
+        if bearer:
+            # Every non-public request acts for the mailbox named in the
+            # caller's own token; no token, no mailbox, no access.
+            principal, reason = _principal_for(scope.get("headers"), claims)
+            if principal is None:
+                return await _send_bearer_401(send, reason)
+            if ctx.pool is not None and ctx.pool.is_rejected(principal):
+                return await _send_bearer_401(send, "Exchange already rejected this token")
+            scope[SCOPE_KEY] = principal
 
         if path == "/mcp":
             if streamable is None:
@@ -251,11 +311,13 @@ def build_app(ctx, settings, streamable: Optional[Any] = None):
                 return await _send_json(send, 400, {"ok": False, "error": {
                     "code": "validation", "message": error.message,
                     "hint": f"See the {name} schema in /openapi.json."}})
-            result = await dispatch(ctx, spec, arguments, transport="rest")
+            with use_principal(scope.get(SCOPE_KEY)):
+                result = await dispatch(ctx, spec, arguments, transport="rest")
             status = 200
             if isinstance(result, dict) and result.get("ok") is False:
                 status = HTTP_BY_CODE.get(result.get("error", {}).get("code", ""), 500)
-            return await _send_json(send, status, result)
+            extra = [BEARER_CHALLENGE] if bearer and status == 401 else None
+            return await _send_json(send, status, result, extra_headers=extra)
 
         return await _send_json(send, 404, {"ok": False, "error": {
             "code": "validation", "message": "not found"}})

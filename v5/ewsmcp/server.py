@@ -2,18 +2,26 @@
 
 import asyncio
 import logging
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from mcp.server import Server
 from mcp.types import Tool, ToolAnnotations
 
-from .audit import AuditLog
+from .audit import AuditLog, mailbox_audit
 from .cache import CacheStore, SyncEngine, SyncLease
 from .cache.lease import DEFAULT_RETRY_SECONDS, LOCK_FILENAME
 from .config import Settings
 from .gateway.client import EWSGateway
 from .gateway.connection import ConnectionManager
-from .ids import NullAliaser, get_aliaser
+from .identity import SCOPE_KEY, Principal, use_principal
+from .ids import (
+    NullAliaser,
+    get_aliaser,
+    get_mailbox_aliaser,
+    mailbox_memory_dir,
+    release_aliaser,
+)
+from .sessions import SessionParts, SessionPool
 from .tools import build_registry
 from .tools.base import Context, dispatch
 
@@ -38,11 +46,64 @@ class _NullAudit:
         return None
 
 
+def mailbox_parts_factory(settings: Settings) -> Callable[[str, str], SessionParts]:
+    """Build one mailbox's stored state: its own alias store and audit chain
+    under ``DATA_DIR/mailboxes/<key>``. Storage failures degrade that
+    mailbox to pass-through components, never the call."""
+
+    def make(mailbox: str, key: str) -> SessionParts:
+        memory_dir: Optional[str] = None
+        try:
+            aliaser: Any = get_mailbox_aliaser(settings.data_dir, key)
+            memory_dir = mailbox_memory_dir(settings.data_dir, key)
+        except Exception as exc:
+            logger.error("mailbox alias store init failed (%s) — raw EWS ids", exc)
+            aliaser = NullAliaser()
+        try:
+            audit: Any = mailbox_audit(settings.data_dir, key, mailbox)
+        except Exception as exc:
+            logger.error("mailbox audit init failed (%s) — audit disabled", exc)
+            audit = _NullAudit()
+
+        def close() -> None:
+            if memory_dir is not None:
+                release_aliaser(memory_dir)
+
+        return SessionParts(aliaser=aliaser, audit=audit, close=close)
+
+    return make
+
+
+def build_bearer_context(settings: Settings) -> Context:
+    """Bearer mode: the process context holds no mailbox of its own — only
+    the session pool. Each call is bound to its caller's mailbox by the
+    dispatcher; calls that never bind (get_server_status, refused tokens)
+    land in the process audit chain."""
+    try:
+        audit: Any = AuditLog(settings.data_dir)
+    except Exception as exc:
+        logger.error("audit init failed (%s) — audit disabled", exc)
+        audit = _NullAudit()
+    pool = SessionPool(settings, parts_factory=mailbox_parts_factory(settings))
+    ctx = Context(
+        settings=settings,
+        gateway=None,
+        manager=None,
+        aliaser=NullAliaser(),
+        audit=audit,
+        pool=pool,
+    )
+    build_registry(ctx)
+    return ctx
+
+
 def build_context(
     settings: Settings,
     *,
     lease_retry_seconds: float = LEASE_RETRY_SECONDS,
 ) -> Context:
+    if settings.bearer_mode:
+        return build_bearer_context(settings)
     gateway = EWSGateway(settings)
     # Aliaser/audit are quality-of-life layers — their storage failing
     # (bad volume, permissions) degrades them to pass-through, never
@@ -123,6 +184,20 @@ async def start_connection_manager(
     *,
     lease_retry_seconds: Optional[float] = None,
 ) -> None:
+    if ctx.pool is not None:
+        # Bearer mode: no warmup or heartbeat — the server holds no
+        # credentials to probe with, and per-mailbox probes would put load
+        # on Exchange in proportion to headcount. Mailboxes connect when
+        # their users call; the janitor closes idle ones.
+        pool = ctx.pool
+        await pool.start()
+
+        async def _stop_pool() -> None:
+            await pool.close()
+
+        setattr(ctx, "_stop_background", _stop_pool)
+        logger.info("bearer mode: mailbox sessions open per caller")
+        return
     manager = ConnectionManager(
         ctx.gateway,
         max_backoff=float(ctx.settings.ews_warmup_max_backoff_seconds),
@@ -282,9 +357,26 @@ def build_mcp_server(ctx: Context) -> Server:
                 "message": f"Unknown tool: {name}",
                 "hint": f"Available: {', '.join(sorted(ctx.registry))}",
             }}
-        return await dispatch(ctx, spec, dict(arguments or {}), transport="mcp")
+        with use_principal(_request_principal(server)):
+            return await dispatch(ctx, spec, dict(arguments or {}), transport="mcp")
 
     return server
+
+
+def _request_principal(server: Server) -> Optional[Principal]:
+    """The principal the HTTP layer parsed for this request, if any.
+
+    Stateless Streamable HTTP runs tool calls in a task started at boot, so
+    a ContextVar set while handling the HTTP request never reaches it; the
+    request object (and its ASGI scope) does. stdio has no request.
+    """
+    try:
+        request = server.request_context.request
+    except LookupError:
+        return None
+    scope = getattr(request, "scope", None)
+    principal = scope.get(SCOPE_KEY) if isinstance(scope, dict) else None
+    return principal if isinstance(principal, Principal) else None
 
 
 async def run_stdio(settings: Settings) -> None:

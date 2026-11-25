@@ -81,13 +81,18 @@ class SessionParts:
 
 
 class MailboxSession:
-    """One mailbox's connections and state inside this process."""
+    """One mailbox's connections and state inside this process.
 
-    def __init__(self, mailbox: str, parts: SessionParts, *, request_slots: int,
-                 now: float):
+    ``parts`` (the stored state) stays ``None`` until a token has been
+    proven for this mailbox: an unproven caller can create, at most, an
+    empty in-memory session that touches nothing on disk.
+    """
+
+    def __init__(self, mailbox: str, *, request_slots: int, now: float):
         self.mailbox = mailbox
         self.key = mailbox_key(mailbox)
-        self.parts = parts
+        self.parts: Optional[SessionParts] = None
+        self.parts_lock = asyncio.Lock()
         self.request_slots = asyncio.Semaphore(max(1, int(request_slots)))
         self.circuit = CircuitState()
         self.text_cache: Any = None  # AttachmentTextCache, created on first use
@@ -98,21 +103,26 @@ class MailboxSession:
         self._gateways: "OrderedDict[str, EWSGateway]" = OrderedDict()
         self._proof_locks: Dict[str, asyncio.Lock] = {}
 
+    def _part(self, name: str) -> Any:
+        if self.parts is None:
+            raise RuntimeError("mailbox state requested before any token was proven")
+        return getattr(self.parts, name)
+
     @property
     def aliaser(self) -> Any:
-        return self.parts.aliaser
+        return self._part("aliaser")
 
     @property
     def audit(self) -> Any:
-        return self.parts.audit
+        return self._part("audit")
 
     @property
     def cache(self) -> Any:
-        return self.parts.cache
+        return self._part("cache")
 
     @property
     def syncer(self) -> Any:
-        return self.parts.syncer
+        return self._part("syncer")
 
     @property
     def gateway_count(self) -> int:
@@ -159,6 +169,8 @@ class MailboxSession:
         self.closed = True
         for fp in list(self._gateways):
             self._drop(fp)
+        if self.parts is None:
+            return
         try:
             self.parts.close()
         except Exception as exc:
@@ -203,7 +215,6 @@ class SessionPool:
         )
         self._gateway_factory = gateway_factory or self._default_gateway
         self._sessions: Dict[str, MailboxSession] = {}
-        self._creating: Dict[str, asyncio.Future] = {}
         self._rejected: "OrderedDict[str, float]" = OrderedDict()
         self._version: Any = None
         self._janitor: Optional[asyncio.Task] = None
@@ -246,16 +257,28 @@ class SessionPool:
         if self._is_rejected(principal.fingerprint, now):
             raise ToolError("auth_failed", "Exchange already rejected this access token.",
                             hint=BEARER_HINT)
-        session = await self._session(principal.mailbox)
+        session = self._session(principal.mailbox)
         gateway = session.gateway_for(principal, self._gateway_factory)
-        session.in_flight += 1
+        session.in_flight += 1  # from here on the janitor leaves it alone
         try:
+            if len(self._sessions) > self.max_sessions:
+                await self._evict_lru()
             await self._prove(session, gateway, principal)
+            await self._ensure_parts(session)
         except BaseException:
             session.in_flight -= 1
             raise
         session.last_used = now
         return Lease(session=session, gateway=gateway)
+
+    async def _ensure_parts(self, session: MailboxSession) -> None:
+        """Open the mailbox's stored state — only ever after a proof."""
+        if session.parts is not None:
+            return
+        async with session.parts_lock:
+            if session.parts is None:
+                session.parts = await asyncio.to_thread(
+                    self._parts_factory, session.mailbox, session.key)
 
     async def _prove(self, session: MailboxSession, gateway: EWSGateway,
                      principal: Principal) -> None:
@@ -284,6 +307,10 @@ class SessionPool:
         while len(self._rejected) > MAX_REJECTED_TOKENS:
             self._rejected.popitem(last=False)
 
+    def is_rejected(self, principal: Principal) -> bool:
+        """True when Exchange already refused this exact token."""
+        return self._is_rejected(principal.fingerprint, self._clock())
+
     def _is_rejected(self, fingerprint: str, now: float) -> bool:
         until = self._rejected.get(fingerprint)
         if until is None:
@@ -295,29 +322,18 @@ class SessionPool:
 
     # ----------------------------------------------------------- sessions
 
-    async def _session(self, mailbox: str) -> MailboxSession:
+    def _session(self, mailbox: str) -> MailboxSession:
+        """Get or create (empty, without touching storage) — synchronous, so
+        two first calls for one mailbox can never create two sessions."""
         key = mailbox_key(mailbox)
         session = self._sessions.get(key)
-        if session is not None and not session.closed:
-            return session
-        pending = self._creating.get(key)
-        if pending is None:
-            pending = asyncio.ensure_future(self._create(mailbox, key))
-            self._creating[key] = pending
-            pending.add_done_callback(lambda _f, k=key: self._creating.pop(k, None))
-        # shield: one cancelled caller must not abort creation for the others
-        return await asyncio.shield(pending)
-
-    async def _create(self, mailbox: str, key: str) -> MailboxSession:
-        parts = await asyncio.to_thread(self._parts_factory, mailbox, key)
-        session = MailboxSession(
-            mailbox, parts,
-            request_slots=self.settings.ews_mailbox_max_concurrency,
-            now=self._clock(),
-        )
-        self._sessions[key] = session
-        if len(self._sessions) > self.max_sessions:
-            await self._evict_lru(keep=key)
+        if session is None or session.closed:
+            session = MailboxSession(
+                mailbox,
+                request_slots=self.settings.ews_mailbox_max_concurrency,
+                now=self._clock(),
+            )
+            self._sessions[key] = session
         return session
 
     def get(self, mailbox: str) -> Optional[MailboxSession]:
@@ -327,13 +343,14 @@ class SessionPool:
         return list(self._sessions.values())
 
     async def _close_session(self, session: MailboxSession) -> None:
-        self._sessions.pop(session.key, None)
+        if self._sessions.get(session.key) is session:
+            del self._sessions[session.key]
         self.evictions += 1
         await asyncio.to_thread(session.close)
 
-    async def _evict_lru(self, keep: Optional[str] = None) -> None:
+    async def _evict_lru(self) -> None:
         idle = sorted(
-            (s for s in self._sessions.values() if s.in_flight == 0 and s.key != keep),
+            (s for s in self._sessions.values() if s.in_flight == 0),
             key=lambda s: s.last_used,
         )
         excess = len(self._sessions) - self.max_sessions
