@@ -51,8 +51,13 @@ class LocalRefusal(ToolError):
     """Refused by this server's own limits; Exchange was not contacted."""
 
 
+def _state_key(ctx: Any) -> str:
+    key = getattr(ctx, "state_key", None)
+    return key if isinstance(key, str) and key else mailbox_key(ctx.mailbox)
+
+
 def _backoff_key(ctx: Any) -> str:
-    return f"backoff:{mailbox_key(ctx.mailbox)}"
+    return f"backoff:{_state_key(ctx)}"
 
 
 def check_backoff(ctx: Any, now: Optional[float] = None) -> None:
@@ -83,7 +88,7 @@ def check_call_budget(ctx: Any, now: Optional[float] = None) -> None:
     if limit <= 0:
         return
     current = time.time() if now is None else now
-    retry = state.backend().hit(f"calls:{mailbox_key(ctx.mailbox)}", limit=limit,
+    retry = state.backend().hit(f"calls:{_state_key(ctx)}", limit=limit,
                                 window_s=CALL_WINDOW_SECONDS, now=current)
     if retry is not None:
         raise LocalRefusal(

@@ -26,6 +26,10 @@ class Settings(BaseSettings):
     #   No token -> HTTP 401. The server holds no Exchange credentials.
     ews_auth_mode: Literal["static", "bearer"] = "static"
     ews_token_mailbox_claims: str = "email,upn,preferred_username,unique_name"
+    # Optional stable user id claim (e.g. "sid"). When set it is required in
+    # every token and keys the user's stored state instead of the address.
+    ews_token_identity_claim: Optional[str] = Field(
+        default=None, pattern=r"^[A-Za-z0-9_:./-]{1,64}$")
 
     # --- Exchange upstream -------------------------------------------------
     ews_server_url: str

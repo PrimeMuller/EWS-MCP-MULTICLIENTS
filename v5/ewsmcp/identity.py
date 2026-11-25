@@ -37,6 +37,7 @@ MAX_TOKEN_CHARS = 16 * 1024
 # Clock skew tolerated on ``exp`` / ``nbf`` between this host and the issuer.
 CLOCK_LEEWAY_SECONDS = 60
 DEFAULT_MAILBOX_CLAIMS = ("email", "upn", "preferred_username", "unique_name")
+MAX_SUBJECT_CHARS = 256
 
 _MAILBOX_RE = re.compile(r"^[^@\s<>\"',;]{1,64}@[^@\s<>\"',;]{1,255}$")
 _B64URL_RE = re.compile(r"^[A-Za-z0-9_-]+$")
@@ -63,6 +64,9 @@ class Principal:
     token: Optional[str] = field(default=None, repr=False, compare=False)
     fingerprint: str = "static"
     expires_at: Optional[float] = None
+    # Stable user identifier from EWS_TOKEN_IDENTITY_CLAIM (e.g. the SID).
+    # When present it, not the address, keys the user's stored state.
+    subject: Optional[str] = None
 
     @property
     def is_bearer(self) -> bool:
@@ -70,7 +74,7 @@ class Principal:
 
     @property
     def key(self) -> str:
-        return mailbox_key(self.mailbox)
+        return subject_key(self.subject) if self.subject else mailbox_key(self.mailbox)
 
     def expired(self, now: Optional[float] = None) -> bool:
         if self.expires_at is None:
@@ -86,6 +90,13 @@ def mailbox_key(mailbox: str) -> str:
     personal data and need no escaping.
     """
     return hashlib.sha256(mailbox.strip().lower().encode("utf-8")).hexdigest()[:24]
+
+
+def subject_key(subject: str) -> str:
+    """State key for a stable user identifier (a SID survives renames and
+    address changes; the hash keeps it out of paths and Redis keys)."""
+    normalized = subject.strip().lower()
+    return hashlib.sha256(f"subject:{normalized}".encode("utf-8")).hexdigest()[:24]
 
 
 def token_fingerprint(token: str) -> str:
@@ -138,12 +149,18 @@ def principal_from_bearer(
     token: str,
     *,
     claims: Sequence[str] = DEFAULT_MAILBOX_CLAIMS,
+    identity_claim: Optional[str] = None,
     now: Optional[float] = None,
 ) -> Principal:
     """Read the mailbox and expiry from a JWT access token's payload.
 
+    ``claims`` name where the mailbox address may be (first match wins);
+    ``identity_claim``, when set, names a stable user identifier (e.g.
+    ``sid``) that must be present and keys the user's stored state.
+
     Raises :class:`BearerError` when the token is not a JWS compact token,
-    has expired, is not yet valid, or names no mailbox in ``claims``.
+    has expired, is not yet valid, names no mailbox in ``claims``, or lacks
+    the identity claim.
     """
     if not isinstance(token, str) or not token or len(token) > MAX_TOKEN_CHARS:
         raise BearerError("malformed")
@@ -160,6 +177,13 @@ def principal_from_bearer(
     nbf = _numeric_claim(payload, "nbf")
     if nbf is not None and nbf > current + CLOCK_LEEWAY_SECONDS:
         raise BearerError("not yet valid")
+    subject: Optional[str] = None
+    if identity_claim:
+        raw_subject = payload.get(identity_claim)
+        if not isinstance(raw_subject, str) or not raw_subject.strip() \
+                or len(raw_subject) > MAX_SUBJECT_CHARS:
+            raise BearerError("no identity claim")
+        subject = raw_subject.strip()
     for claim in claims:
         value = payload.get(claim)
         if isinstance(value, str) and _MAILBOX_RE.match(value.strip()):
@@ -168,6 +192,7 @@ def principal_from_bearer(
                 token=token,
                 fingerprint=token_fingerprint(token),
                 expires_at=exp,
+                subject=subject,
             )
     raise BearerError("no mailbox claim")
 

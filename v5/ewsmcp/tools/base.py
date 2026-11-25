@@ -181,6 +181,14 @@ class Context:
     def bump(self, key: str) -> None:
         self.counters[key] = self.counters.get(key, 0) + 1
 
+    @property
+    def state_key(self) -> str:
+        """Key of this mailbox's shared state (send windows, budgets,
+        back-offs): the session's key when bound, else from the address."""
+        if self.session is not None:
+            return self.session.key
+        return mailbox_key(self.mailbox)
+
     def bind(self, lease: Any) -> "Context":
         """A per-call Context acting on ``lease``'s mailbox and nothing else."""
         session = lease.session
@@ -314,8 +322,8 @@ GLOBAL_SEND_KEY = "sends:*"
 SendSlots = List[Tuple[str, str]]  # (window key, slot id) reserved by one call
 
 
-def _mailbox_send_key(mailbox: str) -> str:
-    return f"sends:{mailbox_key(mailbox)}"
+def _mailbox_send_key(ctx: Context) -> str:
+    return f"sends:{ctx.state_key}"
 
 
 def _send_windows(ctx: Context) -> List[Tuple[str, int, str]]:
@@ -323,7 +331,7 @@ def _send_windows(ctx: Context) -> List[Tuple[str, int, str]]:
     windows = []
     cap = int(ctx.settings.ews_max_sends_per_hour or 0)
     if cap > 0:
-        windows.append((_mailbox_send_key(ctx.mailbox), cap, f"{cap}/hour"))
+        windows.append((_mailbox_send_key(ctx), cap, f"{cap}/hour"))
     global_cap = int(getattr(ctx.settings, "ews_global_max_sends_per_hour", 0) or 0)
     if global_cap > 0:
         windows.append((GLOBAL_SEND_KEY, global_cap, f"{global_cap}/hour for all mailboxes"))
@@ -358,7 +366,7 @@ def _release_send_slot(slots: Optional[SendSlots]) -> None:
 def send_slots_used(ctx: Context) -> int:
     """Sends counted against ``ctx``'s mailbox in the current window."""
     return state.backend().window_count(
-        _mailbox_send_key(ctx.mailbox), window_s=SEND_WINDOW_SECONDS, now=time.time())
+        _mailbox_send_key(ctx), window_s=SEND_WINDOW_SECONDS, now=time.time())
 
 
 def _rate_guard(ctx: Context) -> None:

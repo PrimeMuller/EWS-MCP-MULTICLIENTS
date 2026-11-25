@@ -68,12 +68,12 @@ def _authorized(headers, api_key: str, *, allow_bearer: bool = True) -> bool:
     return False
 
 
-def _principal_for(headers, claims) -> "tuple[Optional[Principal], str]":
+def _principal_for(headers, claims, identity_claim=None) -> "tuple[Optional[Principal], str]":
     token = bearer_token_from_headers(headers)
     if token is None:
         return None, "missing bearer token"
     try:
-        return principal_from_bearer(token, claims=claims), ""
+        return principal_from_bearer(token, claims=claims, identity_claim=identity_claim), ""
     except BearerError as exc:
         return None, f"bearer token not usable ({exc.reason})"
 
@@ -205,6 +205,7 @@ def build_app(ctx, settings, streamable: Optional[Any] = None):
     body_limit = max_body_bytes(settings)
     bearer = bool(getattr(settings, "bearer_mode", False))
     claims = parse_claim_order(getattr(settings, "ews_token_mailbox_claims", ""))
+    identity_claim = getattr(settings, "ews_token_identity_claim", None) or None
 
     async def app(scope, receive, send):
         if scope["type"] == "lifespan":
@@ -264,7 +265,7 @@ def build_app(ctx, settings, streamable: Optional[Any] = None):
         if bearer:
             # Every non-public request acts for the mailbox named in the
             # caller's own token; no token, no mailbox, no access.
-            principal, reason = _principal_for(scope.get("headers"), claims)
+            principal, reason = _principal_for(scope.get("headers"), claims, identity_claim)
             if principal is None:
                 return await _send_bearer_401(send, reason)
             if ctx.pool is not None and ctx.pool.is_rejected(principal):

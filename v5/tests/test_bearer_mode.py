@@ -399,3 +399,42 @@ def test_mcp_tool_calls_read_the_principal_from_the_request_scope():
 
     assert _request_principal(NoRequest()) is None
     assert _request_principal(NS(request_context=NS(request=None))) is None
+
+
+# --- SID-keyed state ------------------------------------------------------------
+
+
+def test_sid_keys_the_session_and_its_stored_state(tmp_path):
+    from ewsmcp.identity import subject_key
+
+    sid = "S-1-5-21-1111-2222-3333-1001"
+    ctx = bearer_ctx(tmp_path, ews_token_identity_claim="sid")
+
+    def token(upn, jti):
+        return make_jwt({"upn": upn, "sid": sid, "jti": jti, "exp": time.time() + 3600})
+
+    async def scenario():
+        principal = principal_from_bearer(token("alice@corp.example", "1"), identity_claim="sid")
+        with use_principal(principal):
+            first = await dispatch(ctx, ctx.registry["whoami"], {})
+        renamed = principal_from_bearer(token("alice.new@corp.example", "2"),
+                                        identity_claim="sid")
+        with use_principal(renamed):
+            second = await dispatch(ctx, ctx.registry["whoami"], {})
+        return first, second
+
+    first, second = asyncio.run(scenario())
+    key = subject_key(sid)
+    session = ctx.pool.get(key)
+    assert session is not None and session.key == key
+    assert len(ctx.pool.sessions()) == 1  # one person, one session
+    assert first["mailbox"] == "alice@corp.example"
+    assert second["mailbox"] == "alice.new@corp.example"  # proven new address
+    assert (Path(ctx.settings.data_dir) / "mailboxes" / key / "memory").is_dir()
+
+
+def test_tokens_without_the_configured_sid_get_401(tmp_path):
+    ctx = _http_ctx(tmp_path, ews_token_identity_claim="sid")
+    status, _, body = _drive(build_app(ctx, ctx.settings), "/api/tools/whoami",
+                             headers=[("authorization", f"Bearer {token_for('a@corp.example')}")])
+    assert status == 401 and "identity claim" in body["error"]["message"]

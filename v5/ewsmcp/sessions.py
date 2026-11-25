@@ -89,9 +89,12 @@ class MailboxSession:
     empty in-memory session that touches nothing on disk.
     """
 
-    def __init__(self, mailbox: str, *, request_slots: int, now: float):
+    def __init__(self, mailbox: str, *, request_slots: int, now: float,
+                 key: Optional[str] = None):
         self.mailbox = mailbox
-        self.key = mailbox_key(mailbox)
+        # The state key: from the stable identity claim (e.g. the SID) when
+        # configured, otherwise from the mailbox address.
+        self.key = key or mailbox_key(mailbox)
         self.parts: Optional[SessionParts] = None
         self.parts_lock = asyncio.Lock()
         self.request_slots = asyncio.Semaphore(max(1, int(request_slots)))
@@ -263,13 +266,15 @@ class SessionPool:
         if self._is_rejected(principal.fingerprint, now):
             raise ToolError("auth_failed", "Exchange already rejected this access token.",
                             hint=BEARER_HINT)
-        session = self._session(principal.mailbox)
+        session = self._session(principal)
         gateway = session.gateway_for(principal, self._gateway_factory)
         session.in_flight += 1  # from here on the janitor leaves it alone
         try:
             if len(self._sessions) > self.max_sessions:
                 await self._evict_lru()
             await self._prove(session, gateway, principal)
+            # Proven: the address in this token is the user's current one.
+            session.mailbox = principal.mailbox
             await self._ensure_parts(session)
         except BaseException:
             session.in_flight -= 1
@@ -356,22 +361,25 @@ class SessionPool:
 
     # ----------------------------------------------------------- sessions
 
-    def _session(self, mailbox: str) -> MailboxSession:
+    def _session(self, principal: Principal) -> MailboxSession:
         """Get or create (empty, without touching storage) — synchronous, so
-        two first calls for one mailbox can never create two sessions."""
-        key = mailbox_key(mailbox)
+        two first calls for one user can never create two sessions."""
+        key = principal.key
         session = self._sessions.get(key)
         if session is None or session.closed:
             session = MailboxSession(
-                mailbox,
+                principal.mailbox,
                 request_slots=self.settings.ews_mailbox_max_concurrency,
                 now=self._clock(),
+                key=key,
             )
             self._sessions[key] = session
         return session
 
-    def get(self, mailbox: str) -> Optional[MailboxSession]:
-        return self._sessions.get(mailbox_key(mailbox))
+    def get(self, mailbox_or_key: str) -> Optional[MailboxSession]:
+        """A live session by mailbox address or by state key."""
+        return (self._sessions.get(mailbox_key(mailbox_or_key))
+                or self._sessions.get(mailbox_or_key))
 
     def sessions(self) -> list:
         return list(self._sessions.values())

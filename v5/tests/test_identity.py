@@ -156,3 +156,32 @@ def test_principal_expiry_uses_leeway():
     p = Principal(mailbox="a@corp.example", token="t", fingerprint="f", expires_at=NOW)
     assert not p.expired(NOW + 30)
     assert p.expired(NOW + 61)
+
+
+# --- a stable identity claim (e.g. the SID) keys the user's state -----------
+
+
+def test_identity_claim_keys_state_by_subject_not_address():
+    from ewsmcp.identity import subject_key
+
+    sid = "S-1-5-21-1004336348-1177238915-682003330-512"
+    token = make_jwt({"upn": "alice@corp.example", "sid": sid, "exp": NOW + 3600})
+    p = principal_from_bearer(token, identity_claim="sid", now=NOW)
+    assert p.mailbox == "alice@corp.example" and p.subject == sid
+    assert p.key == subject_key(sid) != mailbox_key("alice@corp.example")
+    # The same person after an address change keeps the same key.
+    renamed = make_jwt({"upn": "alice.new@corp.example", "sid": sid, "exp": NOW + 3600})
+    assert principal_from_bearer(renamed, identity_claim="sid", now=NOW).key == p.key
+    # Without an identity claim configured, the address keys state as before.
+    assert principal_from_bearer(token, now=NOW).key == mailbox_key("alice@corp.example")
+
+
+@pytest.mark.parametrize("claims", [
+    {"upn": "alice@corp.example"},
+    {"upn": "alice@corp.example", "sid": ""},
+    {"upn": "alice@corp.example", "sid": 512},
+    {"upn": "alice@corp.example", "sid": "S" * 300},
+])
+def test_a_configured_identity_claim_is_required(claims):
+    with pytest.raises(BearerError, match="no identity claim"):
+        principal_from_bearer(make_jwt(claims), identity_claim="sid", now=NOW)
