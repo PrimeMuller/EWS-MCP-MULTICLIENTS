@@ -82,6 +82,14 @@ def kind_for_key(key: str) -> str:
     return _KIND_BY_KEY.get((key or "").lower(), "x")
 
 
+def _unknown_alias(value: str) -> KeyError:
+    return KeyError(
+        f"Unknown alias {value!r}: it is stale or from a previous "
+        "session. EWS ids change when items move; re-run the "
+        "search/list tool to get fresh ids, then retry."
+    )
+
+
 # --- Aliaser implementation ------------------------------------------------
 
 
@@ -327,11 +335,7 @@ class IdAliaser:
             )
             return value
         if row is None:
-            raise KeyError(
-                f"Unknown alias {value!r}: it is stale or from a previous "
-                "session. EWS ids change when items move; re-run the "
-                "search/list tool to get fresh ids, then retry."
-            )
+            raise _unknown_alias(value)
         return row["ews_id"]
 
     def rebind(
@@ -409,6 +413,160 @@ class IdAliaser:
             _LOG.warning("id_alias: stats failed (%s)", exc)
             return {}
         return {row["kind"]: row["c"] for row in rows}
+
+
+def _text(value: object) -> str:
+    return value.decode("utf-8") if isinstance(value, bytes) else str(value)
+
+
+class RedisAliaser:
+    """One mailbox's aliases in Redis/Valkey, shared by every server process.
+
+    Same contract as :class:`IdAliaser` — idempotent minting, stable across
+    moves (``rebind``), unknown alias-shaped input raises ``KeyError``,
+    storage errors fail open to raw ids — so a short id minted while one
+    pod served the call resolves when the next call lands on another pod.
+
+    Everything lives under ``<prefix>:alias:<mailbox_key>:`` (one namespace
+    per mailbox, never shared) in four hashes whose TTL slides forward on
+    every write, so an idle mailbox's aliases expire on their own. Minting
+    reserves counter values with HINCRBY and publishes with HSETNX inside one
+    MULTI; when two pods mint the same id at once the first alias wins and
+    the loser's spare alias still points at the same item.
+    """
+
+    def __init__(self, client: object, *, prefix: str, namespace: str,
+                 ttl_seconds: int) -> None:
+        if not namespace or not namespace.isalnum():
+            raise ValueError("namespace must be a non-empty alphanumeric mailbox key")
+        base = f"{prefix}:alias:{namespace}"
+        self._r = client
+        self._a2i = f"{base}:a2i"
+        self._i2a = f"{base}:i2a"
+        self._imid = f"{base}:imid"
+        self._counters = f"{base}:n"
+        self._ttl = int(ttl_seconds)
+
+    def _touch(self, pipe) -> None:
+        for key in (self._a2i, self._i2a, self._imid, self._counters):
+            pipe.expire(key, self._ttl)
+
+    def alias_for(self, ews_id: str, kind: str = "m", changekey: Optional[str] = None,
+                  internet_message_id: Optional[str] = None) -> str:
+        if not ews_id:
+            return ews_id
+        return self.alias_many([(ews_id, kind, changekey, internet_message_id)]).get(
+            ews_id, ews_id)
+
+    def alias_many(
+        self, entries: "list[tuple[str, str, Optional[str], Optional[str]]]",
+    ) -> "dict[str, str]":
+        out: "dict[str, str]" = {}
+        clean = [
+            (e[0], e[1] if _KIND_RE.match(e[1] or "") else "x", e[3])
+            for e in entries if e and e[0]
+        ]
+        if not clean:
+            return out
+        try:
+            ids = list(dict.fromkeys(c[0] for c in clean))
+            kinds = {c[0]: c[1] for c in clean}
+            for ews_id, alias in zip(ids, self._r.hmget(self._i2a, ids)):
+                if alias is not None:
+                    out[ews_id] = _text(alias)
+            missing = [i for i in ids if i not in out]
+            if missing:
+                by_kind: "dict[str, list[str]]" = {}
+                for ews_id in missing:
+                    by_kind.setdefault(kinds[ews_id], []).append(ews_id)
+                pipe = self._r.pipeline(transaction=False)
+                for kind, group in by_kind.items():
+                    pipe.hincrby(self._counters, kind, len(group))
+                proposed: "dict[str, str]" = {}
+                for (kind, group), top in zip(by_kind.items(), pipe.execute()):
+                    first = int(top) - len(group) + 1
+                    for offset, ews_id in enumerate(group):
+                        proposed[ews_id] = f"{kind}{first + offset}"
+                pipe = self._r.pipeline(transaction=True)
+                for ews_id, alias in proposed.items():
+                    pipe.hset(self._a2i, alias, ews_id)
+                    pipe.hsetnx(self._i2a, ews_id, alias)
+                pipe.hmget(self._i2a, list(proposed))
+                winners = pipe.execute()[-1]
+                for ews_id, winner in zip(proposed, winners):
+                    out[ews_id] = _text(winner) if winner is not None else proposed[ews_id]
+            imids = {c[0]: c[2] for c in clean if isinstance(c[2], str) and c[2]}
+            pipe = self._r.pipeline(transaction=False)
+            if imids:
+                pipe.hset(self._imid, mapping=imids)
+            self._touch(pipe)
+            pipe.execute()
+        except Exception as exc:
+            _LOG.warning("id_alias: shared alias store unavailable (%s); raw ids",
+                         type(exc).__name__)
+        return out
+
+    def resolve(self, value: str) -> str:
+        if not isinstance(value, str) or not _ALIAS_RE.match(value):
+            return value
+        try:
+            raw = self._r.hget(self._a2i, value)
+        except Exception as exc:
+            _LOG.warning("id_alias: shared alias lookup failed (%s); passing through",
+                         type(exc).__name__)
+            return value
+        if raw is None:
+            raise _unknown_alias(value)
+        return _text(raw)
+
+    def rebind(self, old_ews_id: str, new_ews_id: str,
+               changekey: Optional[str] = None) -> Optional[str]:
+        try:
+            alias = self._r.hget(self._i2a, old_ews_id)
+            if alias is None:
+                return None
+            alias = _text(alias)
+            other = self._r.hget(self._i2a, new_ews_id)
+            imid = self._r.hget(self._imid, old_ews_id)
+            pipe = self._r.pipeline(transaction=True)
+            if other is not None and _text(other) != alias:
+                pipe.hdel(self._a2i, _text(other))  # the handle the model holds survives
+            pipe.hdel(self._i2a, old_ews_id)
+            pipe.hset(self._i2a, new_ews_id, alias)
+            pipe.hset(self._a2i, alias, new_ews_id)
+            if imid is not None:
+                pipe.hdel(self._imid, old_ews_id)
+                pipe.hset(self._imid, new_ews_id, imid)
+            self._touch(pipe)
+            pipe.execute()
+            return alias
+        except Exception as exc:
+            _LOG.warning("id_alias: shared rebind failed (%s)", type(exc).__name__)
+            return None
+
+    def imid_for(self, alias_or_id: str) -> Optional[str]:
+        try:
+            ews_id = alias_or_id
+            if _ALIAS_RE.match(alias_or_id or ""):
+                raw = self._r.hget(self._a2i, alias_or_id)
+                ews_id = _text(raw) if raw is not None else alias_or_id
+            imid = self._r.hget(self._imid, ews_id)
+        except Exception as exc:
+            _LOG.warning("id_alias: shared imid lookup failed (%s)", type(exc).__name__)
+            return None
+        return _text(imid) if imid is not None else None
+
+    def stats(self) -> dict:
+        counts: "dict[str, int]" = {}
+        try:
+            for field_name in self._r.hscan_iter(self._a2i, count=500):
+                alias = _text(field_name[0] if isinstance(field_name, tuple) else field_name)
+                kind = alias.rstrip("0123456789")
+                counts[kind] = counts.get(kind, 0) + 1
+        except Exception as exc:
+            _LOG.warning("id_alias: shared stats failed (%s)", type(exc).__name__)
+            return {}
+        return counts
 
 
 class NullAliaser:

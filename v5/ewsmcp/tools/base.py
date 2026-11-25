@@ -17,12 +17,10 @@ import asyncio
 import dataclasses
 import fnmatch
 import inspect
-import threading
 import time
-from collections import deque
 from contextlib import AsyncExitStack
 from dataclasses import dataclass, field
-from typing import Any, Awaitable, Callable, Dict, List, Optional, Union
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple, Union
 
 from ..confirm import (
     consume_token,
@@ -31,8 +29,9 @@ from ..confirm import (
     token_consumed,
     verify_token,
 )
+from .. import state
 from ..errors import AUTH_FAILED_HINT, ToolError, map_exception
-from ..identity import current_principal
+from ..identity import current_principal, mailbox_key
 from ..sessions import CircuitState
 
 TIER_RANK = {"read": 0, "draft": 1, "full": 2}
@@ -53,13 +52,9 @@ CONFIRM_TOKEN_PROPERTY = {
     ),
 }
 
-_SEND_TIMES: deque = deque()
-_SEND_LOCK = threading.Lock()
-
-
 def reset_send_rate_window() -> None:
-    with _SEND_LOCK:
-        _SEND_TIMES.clear()
+    """Tests only."""
+    state.reset_local("sends:")
 
 
 def _positional_arity(fn: Callable[..., Any]) -> int:
@@ -311,33 +306,56 @@ def _kill_switch_guard(ctx: Context, spec: ToolSpec) -> None:
     )
 
 
-def _reserve_send_slot(ctx: Context) -> Optional[float]:
+SEND_WINDOW_SECONDS = 3600
+GLOBAL_SEND_KEY = "sends:*"
+SendSlots = List[Tuple[str, str]]  # (window key, slot id) reserved by one call
+
+
+def _mailbox_send_key(mailbox: str) -> str:
+    return f"sends:{mailbox_key(mailbox)}"
+
+
+def _send_windows(ctx: Context) -> List[Tuple[str, int, str]]:
+    """(window key, cap, label) for every send cap that applies."""
+    windows = []
     cap = int(ctx.settings.ews_max_sends_per_hour or 0)
-    if cap <= 0:
-        return None
+    if cap > 0:
+        windows.append((_mailbox_send_key(ctx.mailbox), cap, f"{cap}/hour"))
+    global_cap = int(getattr(ctx.settings, "ews_global_max_sends_per_hour", 0) or 0)
+    if global_cap > 0:
+        windows.append((GLOBAL_SEND_KEY, global_cap, f"{global_cap}/hour for all mailboxes"))
+    return windows
+
+
+def _reserve_send_slot(ctx: Context) -> Optional[SendSlots]:
+    """Reserve one send in every applicable window (this mailbox's, and the
+    whole server's), all or nothing. Raises ``rate_capped`` when any is full."""
     now = time.time()
-    with _SEND_LOCK:
-        while _SEND_TIMES and now - _SEND_TIMES[0] > 3600:
-            _SEND_TIMES.popleft()
-        if len(_SEND_TIMES) >= cap:
-            retry = max(1, int(3600 - (now - _SEND_TIMES[0])))
+    store = state.backend()
+    taken: SendSlots = []
+    for key, cap, label in _send_windows(ctx):
+        slot, retry = store.reserve(key, limit=cap, window_s=SEND_WINDOW_SECONDS, now=now)
+        if slot is None:
+            _release_send_slot(taken)
             raise ToolError(
                 "rate_capped",
-                f"send rate cap reached ({cap}/hour)",
-                retry_after_s=retry,
+                f"send rate cap reached ({label})",
+                retry_after_s=max(1, int(retry or 1)),
             )
-        _SEND_TIMES.append(now)
-        return now
+        taken.append((key, slot))
+    return taken or None
 
 
-def _release_send_slot(slot_ts: Optional[float]) -> None:
-    if slot_ts is None:
-        return
-    with _SEND_LOCK:
-        for idx in range(len(_SEND_TIMES) - 1, -1, -1):
-            if _SEND_TIMES[idx] == slot_ts:
-                del _SEND_TIMES[idx]
-                return
+def _release_send_slot(slots: Optional[SendSlots]) -> None:
+    store = state.backend()
+    for key, slot in slots or ():
+        store.release(key, slot)
+
+
+def send_slots_used(ctx: Context) -> int:
+    """Sends counted against ``ctx``'s mailbox in the current window."""
+    return state.backend().window_count(
+        _mailbox_send_key(ctx.mailbox), window_s=SEND_WINDOW_SECONDS, now=time.time())
 
 
 def _rate_guard(ctx: Context) -> None:
@@ -458,7 +476,7 @@ async def _confirm_gate(ctx: Context, spec: ToolSpec, kwargs: Dict[str, Any],
             "confirm_token rejected (consumed)",
             hint=_CONFIRM_HINTS["consumed"],
         )
-    reserved_slot: Optional[float] = None
+    reserved_slot: Optional[SendSlots] = None
     if spec.sends_mail(kwargs, content):
         reserved_slot = _reserve_send_slot(ctx)
     if not consume_token(token):

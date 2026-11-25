@@ -7,6 +7,7 @@ from typing import Any, Callable, Dict, List, Optional
 from mcp.server import Server
 from mcp.types import Tool, ToolAnnotations
 
+from . import state
 from .audit import AuditLog, mailbox_audit
 from .cache import CacheStore, SyncEngine, SyncLease
 from .cache.lease import DEFAULT_RETRY_SECONDS, LOCK_FILENAME
@@ -16,6 +17,7 @@ from .gateway.connection import ConnectionManager
 from .identity import SCOPE_KEY, Principal, use_principal
 from .ids import (
     NullAliaser,
+    RedisAliaser,
     get_aliaser,
     get_mailbox_aliaser,
     mailbox_memory_dir,
@@ -53,9 +55,17 @@ def mailbox_parts_factory(settings: Settings) -> Callable[[str, str], SessionPar
 
     def make(mailbox: str, key: str) -> SessionParts:
         memory_dir: Optional[str] = None
+        store = state.backend()
         try:
-            aliaser: Any = get_mailbox_aliaser(settings.data_dir, key)
-            memory_dir = mailbox_memory_dir(settings.data_dir, key)
+            if isinstance(store, state.RedisState):
+                # Shared: a short id minted on one pod resolves on any other.
+                aliaser: Any = RedisAliaser(
+                    store.client, prefix=store.prefix, namespace=key,
+                    ttl_seconds=settings.ews_alias_ttl_seconds,
+                )
+            else:
+                aliaser = get_mailbox_aliaser(settings.data_dir, key)
+                memory_dir = mailbox_memory_dir(settings.data_dir, key)
         except Exception as exc:
             logger.error("mailbox alias store init failed (%s) — raw EWS ids", exc)
             aliaser = NullAliaser()
@@ -102,6 +112,7 @@ def build_context(
     *,
     lease_retry_seconds: float = LEASE_RETRY_SECONDS,
 ) -> Context:
+    state.configure(settings)
     if settings.bearer_mode:
         return build_bearer_context(settings)
     gateway = EWSGateway(settings)

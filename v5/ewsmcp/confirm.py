@@ -14,10 +14,12 @@ valid across restarts; otherwise a per-process secret is used (fine given the
 10-minute default TTL).
 
 Single-use: a verified token must also be *consumed* exactly once
-(``consume_token``). The consumption record is in-process only — after a
-restart an unexpired token could in principle be replayed, which is why the
-TTL stays short and the record is a defense-in-depth layer on top of the
-content binding, not a substitute for it.
+(``consume_token``). Spent-token records live in the state backend
+(``state.py``): in-process by default, or in Redis so that a token spent on
+one server process cannot be replayed on another. Without a shared store
+an unexpired token could in principle be replayed after a restart, which is
+why the TTL stays short and the record is a defense-in-depth layer on top of
+the content binding, not a substitute for it.
 """
 from __future__ import annotations
 
@@ -27,56 +29,48 @@ import hmac
 import json
 import os
 import secrets
-import threading
 import time
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Optional, Tuple
+
+from . import state
 
 DEFAULT_TTL_SECONDS = 600
 # verify_token checks integer seconds (exp < int(now)), so keep spent-token
 # records for a few seconds past integer expiry before pruning.
 CONSUMED_GRACE_SECONDS = 5
+SPENT_PREFIX = "spent:"
 
-# sig -> expiry_ts of tokens already spent on a successful phase-2.
-_CONSUMED: Dict[str, float] = {}
-_CONSUMED_LOCK = threading.Lock()
+
+def _spent_key(token: str) -> str:
+    return SPENT_PREFIX + token.rsplit(".", 1)[-1]
 
 
 def token_consumed(token: str) -> bool:
     """Return True when ``token`` has already been spent (read-only)."""
-    sig = token.rsplit(".", 1)[-1]
-    with _CONSUMED_LOCK:
-        return sig in _CONSUMED
+    return state.backend().exists(_spent_key(token), now=time.time())
 
 
 def consume_token(token: str) -> bool:
     """Mark a (previously verified) token as spent.
 
-    Returns False when the token was already consumed. Expired records are
-    pruned opportunistically so the registry stays bounded by the TTL.
+    Returns False when the token was already consumed. The record lives until
+    the token's own expiry plus a grace period, so the registry stays bounded
+    by the TTL.
     """
-    sig = token.rsplit(".", 1)[-1]
-    expiry = time.time() + DEFAULT_TTL_SECONDS
-    try:  # prefer the token's own expiry for the prune horizon
+    now = time.time()
+    expiry = now + DEFAULT_TTL_SECONDS
+    try:  # prefer the token's own expiry for the record's lifetime
         raw = base64.urlsafe_b64decode(token.rsplit(".", 1)[0].encode("ascii"))
         expiry = float(json.loads(raw).get("e", expiry))
     except Exception:
         pass
-    now = time.time()
-    with _CONSUMED_LOCK:
-        for stale in [
-            s for s, exp in _CONSUMED.items() if exp + CONSUMED_GRACE_SECONDS < now
-        ]:
-            del _CONSUMED[stale]
-        if sig in _CONSUMED:
-            return False
-        _CONSUMED[sig] = expiry
-    return True
+    return state.backend().claim(
+        _spent_key(token), expires_at=expiry + CONSUMED_GRACE_SECONDS, now=now)
 
 
 def reset_consumed_tokens() -> None:
     """Tests only."""
-    with _CONSUMED_LOCK:
-        _CONSUMED.clear()
+    state.reset_local(SPENT_PREFIX)
 
 # Per-process fallback secret when SEND_CONFIRM_SECRET is unset. Tokens then
 # do not survive a restart — acceptable given the short TTL.

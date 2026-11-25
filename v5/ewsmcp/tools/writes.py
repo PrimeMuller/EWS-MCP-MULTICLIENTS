@@ -80,6 +80,7 @@ from exchangelib.recurrence import (
     WeeklyPattern,
 )
 
+from .. import state
 from ..dates import parse_when
 from ..dto import fmt_dt
 from ..errors import ToolError, map_exception
@@ -131,35 +132,27 @@ _OOF_STATE = {
 }
 
 # --- send_draft idempotency (DESIGN.md §Safety, Stripe semantics) ---------------
-# Bounded: entries expire after 48h and the store caps at 512 keys (oldest
-# evicted first) so a long-lived process can't grow it without limit.
-_IDEMPOTENT_SENDS: Dict[str, Dict[str, Any]] = {}
-_IDEMPOTENT_LOCK = threading.Lock()
+# Receipts live in the state backend (shared across processes with Redis) for
+# 48h. In-process they are also capped at 512 (oldest evicted first) so a
+# long-lived process can't grow the store without limit.
+_IDEMPOTENCY_PREFIX = "idem:"
 _IDEMPOTENCY_TTL_S = 48 * 3600
 _IDEMPOTENCY_MAX = 512
 
 
 def reset_idempotency_store() -> None:
     """Tests only."""
-    with _IDEMPOTENT_LOCK:
-        _IDEMPOTENT_SENDS.clear()
+    state.reset_local(_IDEMPOTENCY_PREFIX)
 
 
 def _idempotency_get(key: str) -> Optional[Dict[str, Any]]:
-    now = time.time()
-    with _IDEMPOTENT_LOCK:
-        for stale in [k for k, v in _IDEMPOTENT_SENDS.items()
-                      if now - v.get("ts", 0) > _IDEMPOTENCY_TTL_S]:
-            del _IDEMPOTENT_SENDS[stale]
-        return _IDEMPOTENT_SENDS.get(key)
+    return state.backend().get(_IDEMPOTENCY_PREFIX + key, now=time.time())
 
 
 def _idempotency_put(key: str, record: Dict[str, Any]) -> None:
-    with _IDEMPOTENT_LOCK:
-        while len(_IDEMPOTENT_SENDS) >= _IDEMPOTENCY_MAX:
-            oldest = min(_IDEMPOTENT_SENDS, key=lambda k: _IDEMPOTENT_SENDS[k].get("ts", 0))
-            del _IDEMPOTENT_SENDS[oldest]
-        _IDEMPOTENT_SENDS[key] = record
+    expires_at = float(record.get("ts", time.time())) + _IDEMPOTENCY_TTL_S
+    state.backend().put(_IDEMPOTENCY_PREFIX + key, record, expires_at=expires_at,
+                        now=time.time(), max_entries=_IDEMPOTENCY_MAX)
 
 
 # --- per-draft serialization (self-pruning; never grows unbounded) -----------

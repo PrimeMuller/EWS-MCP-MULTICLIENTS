@@ -8,6 +8,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from ewsmcp import state  # noqa: E402
 from ewsmcp.confirm import reset_consumed_tokens  # noqa: E402
 from ewsmcp.ids import reset_aliaser_cache  # noqa: E402
 from ewsmcp.tools.base import reset_send_rate_window  # noqa: E402
@@ -20,6 +21,7 @@ FIXED_OFFSET_TZ = "Etc/GMT-3"
 @pytest.fixture(autouse=True)
 def _isolate_stores(tmp_path, monkeypatch):
     monkeypatch.setenv("DATA_DIR", str(tmp_path / "data"))
+    state.use_backend(state.LocalState())  # every test starts with a fresh store
     reset_aliaser_cache()
     reset_send_rate_window()
     reset_consumed_tokens()

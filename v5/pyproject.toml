@@ -22,11 +22,17 @@ dependencies = [
 extract = [
     "pypdf>=6.21,<7",
 ]
+# Shared state across server processes (EWS_STATE_BACKEND=redis).
+redis = [
+    "redis>=5,<9",
+]
 dev = [
+    "fakeredis>=2.20",
     "html5lib>=1.1",
     "pypdf>=6.21,<7",
     "pytest>=8",
     "pytest-asyncio>=0.23",
+    "redis>=5,<9",
     "ruff>=0.4",
 ]
 

@@ -68,7 +68,8 @@ class Settings(BaseSettings):
     confirm_ttl_seconds: int = 600  # ONE default everywhere (== confirm.DEFAULT_TTL_SECONDS)
     ews_recipient_allowlist: str = ""
     ews_recipient_denylist: str = ""
-    ews_max_sends_per_hour: int = 10
+    ews_max_sends_per_hour: int = 10  # per mailbox
+    ews_global_max_sends_per_hour: int = Field(default=0, ge=0)  # all mailboxes; 0 = off
     ews_attachment_dir: str = ""
     ews_max_attachment_mb: int = Field(default=25, ge=1, le=50)
     ews_keep_dumpable: bool = False
@@ -79,6 +80,16 @@ class Settings(BaseSettings):
     mcp_port: int = 8000
     mcp_api_key: Optional[str] = None
     log_level: str = "INFO"
+
+    # --- Shared state (spent tokens, send caps, budgets, receipts, aliases) ---
+    # local: this process only. redis: Redis/Valkey shared by every process,
+    # so caps and single-use hold across pods. Holds no mail content.
+    ews_state_backend: Literal["local", "redis"] = "local"
+    ews_redis_url: Optional[str] = None  # e.g. rediss://valkey:6380/0 (from env only)
+    ews_state_prefix: str = Field(default="ewsmcp", pattern=r"^[A-Za-z0-9_.-]{1,40}$")
+    # How long a mailbox's short ids stay resolvable in the shared store
+    # after their last use.
+    ews_alias_ttl_seconds: int = Field(default=7 * 86400, ge=3600)
 
     # --- Storage (NEVER a synced folder) -------------------------------------
     data_dir: str = ""  # empty → ~/.ewsmcp; always resolved to an absolute path
@@ -121,6 +132,8 @@ class Settings(BaseSettings):
         """Fill mode-dependent defaults and refuse combinations that would
         mix mailboxes or cannot work."""
         bearer = self.ews_auth_mode == "bearer"
+        if self.ews_state_backend == "redis" and not (self.ews_redis_url or "").strip():
+            raise ValueError("EWS_STATE_BACKEND=redis needs EWS_REDIS_URL.")
         if self.ews_max_concurrency is None:
             self.ews_max_concurrency = 32 if bearer else 4
         if self.ews_cache_enabled is None:

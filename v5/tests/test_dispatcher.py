@@ -355,16 +355,19 @@ def test_token_consumed_is_read_only():
         chash="hash-1",
         secret="unit-test-secret",
     )["confirm_token"]
-    confirm_mod._CONSUMED["expired-sig"] = 0.0
+    from ewsmcp import state
+
+    spent = state.backend()
+    spent.claim("spent:expired-sig", expires_at=0.0, now=0.0)
 
     assert token_consumed(tok) is False
     assert token_consumed(tok) is False
-    assert "expired-sig" in confirm_mod._CONSUMED  # read-only: no pruning side effects
+    assert "spent:expired-sig" in spent.marks()  # read-only: no pruning side effects
 
     assert consume_token(tok) is True
     assert token_consumed(tok) is True
     assert consume_token(tok) is False
-    assert "expired-sig" not in confirm_mod._CONSUMED
+    assert "spent:expired-sig" not in spent.marks()
 
     reset_consumed_tokens()
     assert token_consumed(tok) is False
@@ -411,7 +414,9 @@ def test_spent_token_cannot_be_replayed_in_expiry_fractional_second(
     tok3 = asyncio.run(dispatch(ctx, spec, dict(kw3)))["confirm_token"]
     spent3 = asyncio.run(dispatch(ctx, spec, {**kw3, "confirm_token": tok3}))
     assert spent3["ok"] is True
-    assert tok1.rsplit(".", 1)[-1] not in confirm_mod._CONSUMED
+    from ewsmcp import state
+
+    assert "spent:" + tok1.rsplit(".", 1)[-1] not in state.backend().marks()
 
 
 def test_recipient_guard_fires_on_write_class(tmp_path):
@@ -898,13 +903,13 @@ def test_consumed_token_while_hour_full_returns_confirm_invalid_and_keeps_slot_c
 
     first = asyncio.run(dispatch(ctx, spec, {**args, "confirm_token": tok}))
     assert first["ok"] is True and first["ran"] is True
-    assert len(base_mod._SEND_TIMES) == 1
+    assert base_mod.send_slots_used(ctx) == 1
 
     replay = asyncio.run(dispatch(ctx, spec, {**args, "confirm_token": tok}))
     assert replay["ok"] is False
     assert replay["error"]["code"] == "confirm_invalid"
     assert "consumed" in replay["error"]["message"]
-    assert len(base_mod._SEND_TIMES) == 1
+    assert base_mod.send_slots_used(ctx) == 1
 
 
 def test_mint_token_mirrors_confirm_gate_binding(tmp_path):
@@ -991,7 +996,7 @@ def test_confirm_gate_releases_reserved_slot_when_consume_token_returns_false(
 
     first = asyncio.run(dispatch(ctx, spec, {**kw1, "confirm_token": tok1}))
     assert first["ok"] is True and first["ran"] is True
-    slots_before = len(base_mod._SEND_TIMES)
+    slots_before = base_mod.send_slots_used(ctx)
     assert slots_before == 1
 
     real_consume = base_mod.consume_token
@@ -1010,7 +1015,7 @@ def test_confirm_gate_releases_reserved_slot_when_consume_token_returns_false(
     assert refused["ok"] is False
     assert refused["error"]["code"] == "confirm_invalid"
     assert "consumed" in refused["error"]["message"]
-    assert len(base_mod._SEND_TIMES) == slots_before
+    assert base_mod.send_slots_used(ctx) == slots_before
 
 
 def test_confirm_gate_two_thread_race_releases_second_reserved_slot(
@@ -1061,7 +1066,7 @@ def test_confirm_gate_two_thread_race_releases_second_reserved_slot(
     assert len(err_runs) == 1
     assert err_runs[0]["error"]["code"] == "confirm_invalid"
     assert "consumed" in err_runs[0]["error"]["message"]
-    assert len(base_mod._SEND_TIMES) == 1
+    assert base_mod.send_slots_used(ctx) == 1
 
 
 @pytest.mark.parametrize("bad_shape", [
