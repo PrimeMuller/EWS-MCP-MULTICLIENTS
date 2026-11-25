@@ -818,3 +818,20 @@ def test_mail_read_importance_and_mime_content_field_pins():
     assert sample.mime_content == raw_eml
 
 
+
+
+def test_queryset_page_size_is_honoured_by_finditem_paging():
+    """The bearer-mode window mirror lists a folder with ``qs.page_size =
+    WINDOW_PAGE_SIZE`` (500) to cut FindItem round trips 5x versus the
+    library default of 100. Pin that the attribute exists per QuerySet and is
+    what the paged FindItem call receives."""
+    from unittest.mock import MagicMock
+
+    from exchangelib.queryset import QuerySet
+
+    qs = QuerySet(FolderCollection(account=MagicMock(), folders=[]))
+    assert "page_size" in vars(qs) and qs.page_size is None
+    assert "page_size=self.page_size" in inspect.getsource(QuerySet._query)
+    # The window code sets page_size, then slices; slicing works on a copy.
+    qs.page_size = 500
+    assert qs._copy_self().page_size == 500

@@ -109,12 +109,20 @@ class Settings(BaseSettings):
 
     # --- Cache mirror (cache-first reads; false = pure EWS, fully functional)
     # Default: on in static mode, off in bearer mode (live reads; Exchange's
-    # own search index already covers every mailbox).
+    # own search index already covers every mailbox). In bearer mode an
+    # enabled mirror is the on-demand window of cache/window.py: refreshed
+    # only by its user's calls, headers + a snippet, deleted when idle.
     ews_cache_enabled: Optional[bool] = None
     ews_cache_folders: str = "inbox,sent"
-    ews_cache_sync_seconds: int = 45
-    ews_cache_hierarchy_seconds: int = 600
-    ews_cache_window_days: int = 365
+    ews_cache_sync_seconds: int = 45  # static mode: background delta interval
+    ews_cache_hierarchy_seconds: int = 600  # static mode: folders/calendar/tasks
+    ews_cache_window_days: Optional[int] = Field(default=None, ge=1)  # 365 static / 14 bearer
+    # Cleaned body kept per mirrored message: 20000 static / 300 bearer
+    # (a snippet; full bodies and full-text search then always go live).
+    ews_cache_body_chars: Optional[int] = Field(default=None, ge=0, le=20_000)
+    ews_cache_refresh_seconds: int = Field(default=60, ge=15)  # bearer: min gap per mailbox
+    ews_cache_max_concurrent_refreshes: int = Field(default=4, ge=1, le=64)  # bearer, per process
+    ews_cache_max_window_items: int = Field(default=1000, ge=50, le=5000)  # bearer, per folder
     ews_cache_purge_on_boot: bool = False  # admin path: wipe + resync from scratch
 
     # --- Optional semantic tier (adapter; core stays dependency-free) --------
@@ -150,6 +158,10 @@ class Settings(BaseSettings):
             self.ews_max_concurrency = 32 if bearer else 4
         if self.ews_cache_enabled is None:
             self.ews_cache_enabled = not bearer
+        if self.ews_cache_window_days is None:
+            self.ews_cache_window_days = 14 if bearer else 365
+        if self.ews_cache_body_chars is None:
+            self.ews_cache_body_chars = 300 if bearer else 20_000
         if self.ews_mailbox_calls_per_minute is None:
             self.ews_mailbox_calls_per_minute = 60 if bearer else 0
         if not bearer:
@@ -164,11 +176,6 @@ class Settings(BaseSettings):
             raise ValueError(
                 "EWS_SEMANTIC_INDEX is single-mailbox (its index has no mailbox "
                 "column) and would mix users' mail in bearer mode; set it to none."
-            )
-        if self.ews_cache_enabled:
-            raise ValueError(
-                "The background mirror polls one mailbox; it is not available in "
-                "bearer mode. Set EWS_CACHE_ENABLED=false."
             )
         return self
 

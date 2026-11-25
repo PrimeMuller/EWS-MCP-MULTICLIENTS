@@ -130,6 +130,11 @@ CREATE TABLE IF NOT EXISTS sender_sigs (
 );
 """
 
+# Cleaned-body length a "full" mirror keeps per message. A mirror built with
+# a shorter body (bearer mode keeps a snippet) only answers questions that
+# headers and snippets can answer; full-text reads go live.
+FULL_BODY_CHARS = 20_000
+
 # A trailing block must recur this often before reads strip it — one
 # coincidental match must never delete real content.
 SIG_MIN_HITS = 3
@@ -162,22 +167,37 @@ def _sig_hash(sender_email: str, block: str) -> str:
 
 
 class CacheStore:
-    """Owner of the mirror database. One instance per process."""
+    """Owner of one mailbox's mirror database.
 
-    def __init__(self, db_path: "str | os.PathLike[str]"):
+    ``body_chars`` is how much cleaned body each row keeps. Below
+    ``FULL_BODY_CHARS`` the mirror holds snippets: ``full_bodies`` is False,
+    reads that need whole bodies or full-text search go live, and per-sender
+    signature learning is off (a snippet's last lines are not a signature).
+    """
+
+    def __init__(self, db_path: "str | os.PathLike[str]", *,
+                 body_chars: int = FULL_BODY_CHARS):
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         try:  # owner-only, best effort (no-op on Windows ACLs)
             os.chmod(self.db_path.parent, 0o700)
         except OSError:
             pass
+        self.body_chars = int(body_chars)
+        self.full_bodies = self.body_chars >= FULL_BODY_CHARS
+        self.learn_signatures = self.full_bodies
         self._lock = threading.RLock()
         self._writer: Optional[sqlite3.Connection] = None
+        self._closed = False
         self._ensure_schema()
 
     # ------------------------------------------------------------ plumbing
 
     def _writer_conn(self) -> sqlite3.Connection:
+        if self._closed:
+            # A refresh still running when the mirror was evicted must not
+            # quietly recreate the files that eviction deleted.
+            raise sqlite3.ProgrammingError("mirror is closed")
         if self._writer is None:
             conn = sqlite3.connect(str(self.db_path), timeout=10.0,
                                    check_same_thread=False)
@@ -232,9 +252,22 @@ class CacheStore:
 
     def close(self) -> None:
         with self._lock:
+            self._closed = True
             if self._writer is not None:
                 self._writer.close()
                 self._writer = None
+
+    def destroy(self) -> None:
+        """Close and delete the mirror (idle eviction in bearer mode): no mail
+        stays at rest for a mailbox nobody is using."""
+        self.close()
+        for suffix in ("", "-wal", "-shm", "-journal"):
+            try:
+                Path(f"{self.db_path}{suffix}").unlink()
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                logger.warning("mirror file could not be deleted: %s", exc)
 
     # ------------------------------------------------------------- writers
 
@@ -255,7 +288,7 @@ class CacheStore:
         if not rows:
             return 0
         with self._write() as conn:
-            for r in rows:
+            for r in rows if self.learn_signatures else ():
                 block = trailing_block(r.get("body_clean") or "")
                 sender = (r.get("sender_email") or "").lower()
                 if block and sender:
@@ -311,6 +344,15 @@ class CacheStore:
 
     # Write-through spellings used by the tool handlers:
     tombstone_messages = delete_messages_by_id
+
+    def prune_folder_before(self, folder: str, before_ts: int) -> int:
+        """Drop one folder's rows older than ``before_ts`` (the window edge)."""
+        with self._write() as conn:
+            cur = conn.execute(
+                "DELETE FROM messages WHERE folder=? AND (date_ts IS NULL OR date_ts < ?)",
+                (folder, int(before_ts)),
+            )
+            return cur.rowcount
 
     def set_read_flag(self, ews_ids: List[str], is_read: bool) -> None:
         if not ews_ids:
@@ -540,6 +582,15 @@ class CacheStore:
         if row is not None and row["hits"] >= SIG_MIN_HITS:
             return body.rstrip().rpartition("\n\n")[0].rstrip()
         return body
+
+    def window_changekeys(self, folder: str, since_ts: int) -> Dict[str, Optional[str]]:
+        """{ews_id: changekey} of one folder's rows inside the window."""
+        with self._read() as conn:
+            rows = conn.execute(
+                "SELECT ews_id, changekey FROM messages WHERE folder=? AND date_ts >= ?",
+                (folder, int(since_ts)),
+            ).fetchall()
+        return {r["ews_id"]: r["changekey"] for r in rows}
 
     def get_message(self, ews_id: str) -> Optional[sqlite3.Row]:
         with self._read() as conn:

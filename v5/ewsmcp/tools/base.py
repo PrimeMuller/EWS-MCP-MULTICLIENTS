@@ -634,6 +634,13 @@ async def dispatch(ctx: Context, spec: ToolSpec, kwargs: Dict[str, Any],
         # their slot inside _confirm_gate before consume_token)
         elif spec.sends_mail(kwargs):
             _rate_guard(ctx)
+        # Window mirror (bearer mode): the user is active, so refresh their
+        # mirror in the background when due. Never waits on it; reads stay
+        # live until it is ready.
+        if ctx.session is not None and spec.requires_ews:
+            refresh = getattr(ctx.sync, "maybe_refresh", None)
+            if callable(refresh):
+                refresh(ctx.gateway)
         # Alias → raw ids
         if spec.resolve_ids:
             kwargs = _resolve_ids(ctx, kwargs)

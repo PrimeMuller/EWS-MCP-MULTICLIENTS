@@ -9,7 +9,7 @@ from mcp.types import Tool, ToolAnnotations
 
 from . import state
 from .audit import AuditLog, mailbox_audit
-from .cache import CacheStore, SyncEngine, SyncLease
+from .cache import CacheStore, SyncEngine, SyncLease, WindowSync
 from .cache.lease import DEFAULT_RETRY_SECONDS, LOCK_FILENAME
 from .config import Settings
 from .gateway.client import EWSGateway
@@ -48,10 +48,21 @@ class _NullAudit:
         return None
 
 
-def mailbox_parts_factory(settings: Settings) -> Callable[[str, str], SessionParts]:
+def mailbox_cache_path(settings: Settings, key: str) -> str:
+    return f"{settings.data_dir}/mailboxes/{key}/cache/mirror.db"
+
+
+def mailbox_parts_factory(
+    settings: Settings,
+    *,
+    refresh_limiter: Optional[asyncio.Semaphore] = None,
+) -> Callable[[str, str], SessionParts]:
     """Build one mailbox's stored state: its own alias store and audit chain
-    under ``DATA_DIR/mailboxes/<key>``. Storage failures degrade that
-    mailbox to pass-through components, never the call."""
+    under ``DATA_DIR/mailboxes/<key>`` and, when the mirror is enabled, an
+    on-demand window mirror that is deleted with the session. Storage
+    failures degrade that mailbox to pass-through components, never the
+    call."""
+    limiter = refresh_limiter or asyncio.Semaphore(settings.ews_cache_max_concurrent_refreshes)
 
     def make(mailbox: str, key: str) -> SessionParts:
         memory_dir: Optional[str] = None
@@ -75,11 +86,25 @@ def mailbox_parts_factory(settings: Settings) -> Callable[[str, str], SessionPar
             logger.error("mailbox audit init failed (%s) — audit disabled", exc)
             audit = _NullAudit()
 
+        cache: Any = None
+        syncer: Any = None
+        if settings.ews_cache_enabled:
+            try:
+                cache = CacheStore(mailbox_cache_path(settings, key),
+                                   body_chars=settings.ews_cache_body_chars)
+                syncer = WindowSync(settings, cache, limiter=limiter)
+            except Exception as exc:
+                logger.error("mailbox mirror init failed (%s) — live reads", exc)
+                cache, syncer = None, None
+
         def close() -> None:
+            if cache is not None:
+                cache.destroy()  # no mail stays at rest for an idle mailbox
             if memory_dir is not None:
                 release_aliaser(memory_dir)
 
-        return SessionParts(aliaser=aliaser, audit=audit, close=close)
+        return SessionParts(aliaser=aliaser, audit=audit, cache=cache, syncer=syncer,
+                            close=close)
 
     return make
 
@@ -94,7 +119,9 @@ def build_bearer_context(settings: Settings) -> Context:
     except Exception as exc:
         logger.error("audit init failed (%s) — audit disabled", exc)
         audit = _NullAudit()
-    pool = SessionPool(settings, parts_factory=mailbox_parts_factory(settings))
+    refresh_limiter = asyncio.Semaphore(settings.ews_cache_max_concurrent_refreshes)
+    pool = SessionPool(settings, parts_factory=mailbox_parts_factory(
+        settings, refresh_limiter=refresh_limiter))
     ctx = Context(
         settings=settings,
         gateway=None,

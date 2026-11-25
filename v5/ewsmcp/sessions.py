@@ -380,6 +380,14 @@ class SessionPool:
         if self._sessions.get(session.key) is session:
             del self._sessions[session.key]
         self.evictions += 1
+        # Stop a running mirror refresh first (on the loop), then release
+        # connections and stored state (blocking I/O, off the loop).
+        stop = getattr(session.parts.syncer if session.parts else None, "stop", None)
+        if callable(stop):
+            try:
+                await stop()
+            except Exception as exc:
+                logger.debug("mirror refresh stop failed: %s", exc)
         await asyncio.to_thread(session.close)
 
     async def _evict_lru(self) -> None:

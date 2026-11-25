@@ -134,10 +134,20 @@ def test_static_mode_still_requires_a_mailbox():
     assert s.ews_max_concurrency == 4 and s.ews_cache_enabled is True
 
 
+def test_bearer_mode_mirror_is_opt_in_and_a_short_snippet_window():
+    off = Settings(ews_server_url=ENDPOINT, ews_auth_mode="bearer", mcp_transport="http")
+    on = Settings(ews_server_url=ENDPOINT, ews_auth_mode="bearer", mcp_transport="http",
+                  ews_cache_enabled=True)
+    assert off.ews_cache_enabled is False
+    assert on.ews_cache_enabled is True
+    assert (on.ews_cache_window_days, on.ews_cache_body_chars) == (14, 300)
+    static = Settings(ews_server_url=ENDPOINT, ews_email="exec@corp.example")
+    assert (static.ews_cache_window_days, static.ews_cache_body_chars) == (365, 20_000)
+
+
 @pytest.mark.parametrize("overrides, message", [
     ({"mcp_transport": "stdio"}, "MCP_TRANSPORT=http"),
     ({"ews_semantic_index": "pgvector"}, "EWS_SEMANTIC_INDEX"),
-    ({"ews_cache_enabled": True}, "EWS_CACHE_ENABLED"),
 ])
 def test_bearer_mode_refuses_settings_that_would_mix_mailboxes(overrides, message):
     base = dict(ews_server_url=ENDPOINT, ews_auth_mode="bearer", mcp_transport="http")

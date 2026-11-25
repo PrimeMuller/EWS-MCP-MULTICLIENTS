@@ -29,7 +29,7 @@ from exchangelib.errors import UnauthorizedError
 from ..bodyclean import clean_body
 from ..dto import fmt_dt
 from ..gateway.client import WELL_KNOWN
-from .store import CacheStore
+from .store import FULL_BODY_CHARS, CacheStore
 
 logger = logging.getLogger(__name__)
 
@@ -41,7 +41,7 @@ ITEM_FIELDS = [
     "message_id", "to_recipients", "text_body",
 ]
 TASK_FIELDS = ["id", "changekey", "subject", "due_date", "is_complete", "status"]
-BODY_CLEAN_MAX = 20_000
+BODY_CLEAN_MAX = FULL_BODY_CHARS
 CALENDAR_WINDOW_DAYS = 14
 CALENDAR_MAX_ITEMS = 200
 
@@ -61,8 +61,10 @@ def _ts(dt: Any, tz: Optional[str] = None, *, is_end: bool = False) -> Optional[
         return None
 
 
-def row_from_message(item: Any, folder_key: str, tz: str) -> Dict[str, Any]:
-    """Message item → mirror row. Body cleaned HERE (the 700× paid once)."""
+def row_from_message(item: Any, folder_key: str, tz: str,
+                     body_chars: int = BODY_CLEAN_MAX) -> Dict[str, Any]:
+    """Message item → mirror row. Body cleaned HERE (the 700× paid once);
+    ``body_chars`` below ``BODY_CLEAN_MAX`` keeps only a snippet."""
     sender = getattr(item, "sender", None)
     sender_email = getattr(sender, "email_address", None) or ""
     sender_name = getattr(sender, "name", None) or ""
@@ -71,9 +73,9 @@ def row_from_message(item: Any, folder_key: str, tz: str) -> Dict[str, Any]:
     body_clean = ""
     if text:
         try:
-            body_clean = clean_body(text, max_chars=BODY_CLEAN_MAX)["text"]
+            body_clean = clean_body(text, max_chars=body_chars)["text"]
         except Exception:
-            body_clean = text[:BODY_CLEAN_MAX]
+            body_clean = text[:body_chars]
     to = [
         r.email_address
         for r in (getattr(item, "to_recipients", None) or [])
@@ -135,6 +137,21 @@ def row_from_task(item: Any, tz: str) -> Dict[str, Any]:
         "is_complete": 1 if getattr(item, "is_complete", False) else 0,
         "status": str(getattr(item, "status", None) or "") or None,
     }
+
+
+def refresh_calendar_window(account: Any, store: CacheStore, tz: str) -> None:
+    """Replace the mirrored calendar with today + CALENDAR_WINDOW_DAYS of
+    expanded occurrences (one CalendarView request, capped server-side)."""
+    now = datetime.now(ZoneInfo(tz))
+    day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    events = list(account.calendar.view(
+        start=day_start,
+        end=day_start + timedelta(days=CALENDAR_WINDOW_DAYS),
+        max_items=CALENDAR_MAX_ITEMS,
+    ))
+    store.replace_events(
+        [row_from_event(ev, tz) for ev in events if getattr(ev, "id", None)])
+    store.set_sync_state("events", None, time.time())
 
 
 class SyncEngine:
@@ -296,17 +313,7 @@ class SyncEngine:
 
         # Expanded calendar occurrences for the overview window.
         try:
-            now = datetime.now(ZoneInfo(tz))
-            day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-            events = list(account.calendar.view(
-                start=day_start,
-                end=day_start + timedelta(days=CALENDAR_WINDOW_DAYS),
-                max_items=CALENDAR_MAX_ITEMS,
-            ))
-            self.store.replace_events(
-                [row_from_event(ev, tz) for ev in events
-                 if getattr(ev, "id", None)])
-            self.store.set_sync_state("events", None, time.time())
+            refresh_calendar_window(account, self.store, tz)
         except UnauthorizedError:
             raise
         except Exception as exc:

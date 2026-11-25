@@ -100,6 +100,13 @@ def _cache_watermark(ctx: Context, folder_key: str) -> Optional[int]:
     return ctx.cache.watermark(f"item:{folder_key}")
 
 
+def _mirror_has_bodies(ctx: Context) -> bool:
+    """True when the mirror keeps whole cleaned bodies. A snippet mirror
+    (bearer mode) never answers full reads or full-text search: those go to
+    Exchange, whose own index covers the whole mailbox."""
+    return ctx.cache is not None and bool(getattr(ctx.cache, "full_bodies", True))
+
+
 def _row_body(ctx: Context, row: Any) -> str:
     """Cleaned body with the sender's LEARNED signature stripped (the
     deterministic per-sender trailing-block learning from sync time)."""
@@ -1167,7 +1174,8 @@ async def _search_messages(ctx: Context, query: Optional[str] = None,
     # Multi-folder fan-out (`f:all`, `recursive`) and `flag_complete` (not
     # stored in the mirror schema) always run live.
     folder_key = _cache_folder_key(ctx, folder)
-    if not fresh and not fan_out and flag_complete is None and folder_key:
+    if (not fresh and not fan_out and flag_complete is None and folder_key
+            and (not query or _mirror_has_bodies(ctx))):
         as_of = _cache_watermark(ctx, folder_key)
         if as_of:
             try:
@@ -1778,7 +1786,7 @@ async def _get_message(ctx: Context, id: str, format: Optional[str] = "full",
 
     # Mirror unless the caller needs live data: fresh=true, raw HTML, or an
     # attachment inventory (the mirror stores the flag, not the parts).
-    if not fresh and not include_html and ctx.cache is not None:
+    if not fresh and not include_html and _mirror_has_bodies(ctx):
         try:
             row = await asyncio.to_thread(ctx.cache.get_message, raw_id)
         except Exception as exc:
@@ -1886,7 +1894,7 @@ async def _get_messages(
     by_index: Dict[int, Tuple[Dict[str, Any], str, Optional[int]]] = {}
     live_needed: List[Tuple[int, str, str]] = []
 
-    if not fresh and ctx.cache is not None:
+    if not fresh and _mirror_has_bodies(ctx):
         try:
             def read_cached() -> Tuple[
                 Dict[int, Tuple[Dict[str, Any], str, Optional[int]]],
@@ -2148,7 +2156,7 @@ async def _get_thread(ctx: Context, id: str, limit: int = 20,
     raw_id = id
     tz = ctx.settings.ews_tz
 
-    if not fresh and ctx.cache is not None:
+    if not fresh and _mirror_has_bodies(ctx):
         try:
             cached = await asyncio.to_thread(
                 _thread_from_cache, ctx, raw_id, limit, offset)
@@ -2649,7 +2657,8 @@ async def _get_mailbox_overview(ctx: Context, horizon_days: int = 1,
 
     # ---- pure mirror + watermark (sub-100ms warm) --------------------------
     as_of = _cache_watermark(ctx, "inbox") if not fresh else None
-    if as_of and ctx.cache is not None:
+    # Both halves must be mirrored: unread mail AND the calendar window.
+    if as_of and ctx.cache is not None and ctx.cache.watermark("events"):
         try:
             def read_mirror():
                 unread_total, rows = ctx.cache.unread_page(limit=10)
