@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import time
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
@@ -221,6 +222,11 @@ class SessionPool:
         self.idle_seconds = max(60, int(settings.ews_mailbox_idle_seconds))
         self.max_sessions = max(1, int(settings.ews_max_mailboxes))
         self.evictions = 0
+        # Process-wide upstream circuit: consecutive "Exchange unreachable"
+        # outcomes across ALL mailboxes. Reset by any answer from Exchange.
+        self.upstream = CircuitState()
+        self.upstream_threshold = int(getattr(settings, "ews_global_circuit_threshold", 0) or 0)
+        self.upstream_open_seconds = max(1, int(settings.circuit_open_seconds))
 
     # ----------------------------------------------------------- gateways
 
@@ -319,6 +325,34 @@ class SessionPool:
             del self._rejected[fingerprint]
             return False
         return True
+
+    # ------------------------------------------------- upstream circuit
+
+    def upstream_retry_after(self, now: Optional[float] = None) -> Optional[int]:
+        """Seconds until calls may reach Exchange again, while the
+        process-wide circuit is open."""
+        current = self._clock() if now is None else now
+        if self.upstream.open_until > current:
+            return max(1, math.ceil(self.upstream.open_until - current))
+        return None
+
+    def note_upstream(self, ok: bool, now: Optional[float] = None) -> None:
+        """Feed one Exchange outcome to the process-wide circuit."""
+        if ok:
+            self.upstream.failures = 0
+            return
+        if self.upstream_threshold <= 0:
+            return
+        self.upstream.failures += 1
+        if self.upstream.failures >= self.upstream_threshold:
+            current = self._clock() if now is None else now
+            self.upstream.open_until = current + self.upstream_open_seconds
+            self.upstream.failures = 0
+            logger.warning(
+                "Exchange unreachable for %d calls in a row across mailboxes; "
+                "pausing all calls for %ds", self.upstream_threshold,
+                self.upstream_open_seconds,
+            )
 
     # ----------------------------------------------------------- sessions
 
@@ -419,4 +453,5 @@ class SessionPool:
             "rejected_tokens": len(self._rejected),
             "evictions": self.evictions,
             "idle_seconds": self.idle_seconds,
+            "upstream_circuit_open": self.upstream_retry_after() is not None,
         }

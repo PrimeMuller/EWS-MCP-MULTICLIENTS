@@ -216,10 +216,10 @@ def test_pack_exports_eight_read_specs():
 # --- search_messages -----------------------------------------------------------
 
 
-def _whole_mailbox(tmp_path, folders):
+def _whole_mailbox(tmp_path, folders, **overrides):
     account = _account()
     account.mail_folders = list(folders.items())
-    return _ctx(tmp_path, account)
+    return _ctx(tmp_path, account, **overrides)
 
 
 def test_search_whole_mailbox_merges_folders_newest_first(tmp_path):
@@ -1180,6 +1180,23 @@ def test_check_messages_mirror_provenance_fresh_and_values_schema(tmp_path):
         store.close()
 
 
+def test_search_fanout_default_cap_is_50_folders(tmp_path):
+    """Each folder is one FindItem request: the default cap bounds what one
+    f:all search costs Exchange."""
+    folders = {
+        f"F{idx:03d}": _Query(
+            [_neutral_msg(f"M-{idx}=", f"hit-{idx}", dt=datetime(2026, 6, 10, tzinfo=TZ))]
+            if idx in (0, 49, 50) else [])
+        for idx in range(60)
+    }
+    res = _run(_whole_mailbox(tmp_path, folders), "search_messages", folder="f:all",
+               subject="x")
+    assert res["ok"] is True
+    assert res["folders_searched"] == 50 and res["folders_skipped"] == 10
+    assert {i["folder"] for i in res["items"]} == {"F000", "F049"}
+    assert folders["F050"].filter_calls == []
+
+
 def test_search_fanout_caps_at_200_folders_and_500_window(tmp_path):
     folders = {}
     for idx in range(205):
@@ -1188,7 +1205,8 @@ def test_search_fanout_caps_at_200_folders_and_500_window(tmp_path):
             if idx in (0, 199, 200) else []
         )
         folders[f"F{idx:03d}"] = _Query(msgs)
-    ctx = _whole_mailbox(tmp_path, folders)
+    # The setting may raise the cap up to the hard ceiling of 200.
+    ctx = _whole_mailbox(tmp_path, folders, ews_fanout_max_folders=200)
 
     res = _run(ctx, "search_messages", folder="f:all", subject="x")
     assert res["ok"] is True

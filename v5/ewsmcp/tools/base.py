@@ -30,11 +30,14 @@ from ..confirm import (
     verify_token,
 )
 from .. import state
-from ..errors import AUTH_FAILED_HINT, ToolError, map_exception
+from ..errors import AUTH_FAILED_HINT, ToolError, explicit_backoff_seconds, map_exception
 from ..identity import current_principal, mailbox_key
 from ..sessions import CircuitState
+from ..throttle import LocalRefusal, check_backoff, check_call_budget, record_backoff
 
 TIER_RANK = {"read": 0, "draft": 1, "full": 2}
+# Outcomes that prove Exchange answered (they close the upstream circuit).
+_EXCHANGE_ANSWERED = frozenset({"ok", "phase1", "not_found"})
 CLASS_TIER = {"read": "read", "write": "draft", "send": "full", "destructive": "full"}
 ID_KEYS = frozenset({
     "id", "message_id", "draft_id", "event_id", "thread_id", "reply_to", "folder",
@@ -543,6 +546,8 @@ async def dispatch(ctx: Context, spec: ToolSpec, kwargs: Dict[str, Any],
     confirm_token = kwargs.pop("confirm_token", None)
     kwargs.pop(VERIFIED_CONTENT_HASH_ARG, None)
     binding = AsyncExitStack()
+    pool = ctx.pool
+    local_refusal = False  # refused by our own limits: Exchange never saw it
     try:
         # Kill-switch (policy precedes connectivity)
         if spec.sends_mail(kwargs):
@@ -555,20 +560,35 @@ async def dispatch(ctx: Context, spec: ToolSpec, kwargs: Dict[str, Any],
                 "tier_blocked",
                 f"{spec.name} needs capability tier '{need}'; server runs '{tier}'.",
             )
+        # Process-wide upstream circuit (bearer mode): Exchange is failing
+        # for everyone, so nothing is sent — not even a token proof.
+        if pool is not None and spec.requires_ews:
+            wait = pool.upstream_retry_after()
+            if wait is not None:
+                raise LocalRefusal(
+                    "upstream_unavailable",
+                    "Exchange is failing for every mailbox; calls are paused.",
+                    retry_after_s=wait,
+                )
         # Mailbox binding (bearer mode): prove the caller's token, then act
         # on ITS mailbox only. From here on ``ctx`` is the bound context, so
         # every later gate, the handler, and the audit record belong to it.
-        if ctx.pool is not None and ctx.session is None and spec.mailbox_scoped:
-            lease = await binding.enter_async_context(ctx.pool.bind(current_principal()))
+        if pool is not None and ctx.session is None and spec.mailbox_scoped:
+            lease = await binding.enter_async_context(pool.bind(current_principal()))
             ctx = ctx.bind(lease)
-        # Circuit breaker
+        # Circuit breaker (this mailbox's own)
         now = time.time()
         if spec.requires_ews and ctx._circuit_open_until > now:
-            raise ToolError(
+            raise LocalRefusal(
                 "upstream_unavailable",
                 "circuit open after repeated upstream failures",
                 retry_after_s=int(ctx._circuit_open_until - now),
             )
+        # Exchange protection: a back-off Exchange stated for this mailbox,
+        # then the mailbox's call budget (refusals cost Exchange nothing).
+        if spec.requires_ews:
+            check_backoff(ctx, now)
+            check_call_budget(ctx, now)
         # Cold / auth gate
         if spec.requires_ews and ctx.manager is not None:
             mstate = ctx.manager.state
@@ -624,6 +644,7 @@ async def dispatch(ctx: Context, spec: ToolSpec, kwargs: Dict[str, Any],
         return result
     except ToolError as err:
         outcome = err.code
+        local_refusal = isinstance(err, LocalRefusal)
         return err.to_dict()
     except (TypeError, ValueError) as exc:
         # Handler contract violations (wrong kwarg names/types) are caller
@@ -641,8 +662,19 @@ async def dispatch(ctx: Context, spec: ToolSpec, kwargs: Dict[str, Any],
             if ctx._circuit_failures >= ctx.settings.circuit_failure_threshold:
                 ctx._circuit_open_until = time.time() + ctx.settings.circuit_open_seconds
                 ctx._circuit_failures = 0
+        if err.code == "throttled":
+            # Exchange stated how long this mailbox must wait: hold every
+            # further call for it here instead of letting them hit Exchange.
+            wait = explicit_backoff_seconds(exc)
+            if wait:
+                record_backoff(ctx, wait)
         return err.to_dict()
     finally:
+        if pool is not None and spec.requires_ews and not local_refusal:
+            if outcome == "upstream_unavailable":
+                pool.note_upstream(False)
+            elif outcome in _EXCHANGE_ANSWERED:
+                pool.note_upstream(True)
         ctx.bump(f"tool.{spec.name}")
         if outcome != "ok":
             ctx.bump(f"err.{outcome}")

@@ -43,7 +43,10 @@ class Settings(BaseSettings):
     # --- Reliability --------------------------------------------------------
     ews_warmup_max_backoff_seconds: int = 300
     ews_heartbeat_seconds: int = 600
-    ews_retry_max_wait_seconds: int = 300
+    # Longest wait exchangelib may sleep inside a worker when Exchange says
+    # "back off". Anything longer is returned to the caller as `throttled`
+    # with retry_after_s instead of holding a thread (and the caller) hostage.
+    ews_retry_max_wait_seconds: int = Field(default=5, ge=0, le=3600)
     ews_auth_failure_cooldown_seconds: int = Field(default=900, ge=60)
     ews_auth_max_rejections: int = Field(default=3, ge=1, le=10)
     # Worker threads for Exchange calls: the process-wide cap on requests in
@@ -58,6 +61,15 @@ class Settings(BaseSettings):
     # sessions go first.
     ews_mailbox_idle_seconds: int = Field(default=1800, ge=60)
     ews_max_mailboxes: int = Field(default=2000, ge=1)
+    # Tool calls one mailbox may make per minute (default 60 in bearer mode,
+    # 0 = off in static mode). Stops a runaway agent before Exchange has to.
+    ews_mailbox_calls_per_minute: Optional[int] = Field(default=None, ge=0)
+    # Bearer mode: this many "Exchange unreachable" outcomes in a row, across
+    # all mailboxes, pause every call for CIRCUIT_OPEN_SECONDS. 0 = off.
+    ews_global_circuit_threshold: int = Field(default=20, ge=0)
+    # Folders one multi-folder search (folder="f:all", recursive=true) may
+    # fan out to; each folder is one FindItem request.
+    ews_fanout_max_folders: int = Field(default=50, ge=1, le=200)
     circuit_failure_threshold: int = 5
     circuit_open_seconds: int = 60
 
@@ -138,6 +150,8 @@ class Settings(BaseSettings):
             self.ews_max_concurrency = 32 if bearer else 4
         if self.ews_cache_enabled is None:
             self.ews_cache_enabled = not bearer
+        if self.ews_mailbox_calls_per_minute is None:
+            self.ews_mailbox_calls_per_minute = 60 if bearer else 0
         if not bearer:
             if not (self.ews_email or "").strip():
                 raise ValueError("EWS_EMAIL is required when EWS_AUTH_MODE=static.")

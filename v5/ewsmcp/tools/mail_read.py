@@ -816,6 +816,9 @@ async def _search_semantic(ctx: Context, query: str, folder_key: str,
 
 
 ALL_FOLDERS = "f:all"
+# Hard ceiling on one multi-folder search; the working cap is the
+# EWS_FANOUT_MAX_FOLDERS setting (default 50): each folder costs Exchange
+# one FindItem request, so the cap is the price of one f:all search.
 MAX_FANOUT_FOLDERS = 200
 MAX_FANOUT_WINDOW = 500
 
@@ -1023,7 +1026,9 @@ async def _search_all_folders(
         )
 
     all_in_scope = await ctx.gateway.call(list_scope)
-    folders = all_in_scope[:MAX_FANOUT_FOLDERS]
+    cap = min(MAX_FANOUT_FOLDERS,
+              int(getattr(ctx.settings, "ews_fanout_max_folders", MAX_FANOUT_FOLDERS)))
+    folders = all_in_scope[:cap]
     skipped = len(all_in_scope) - len(folders)
     wanted = offset + limit
 
