@@ -375,3 +375,70 @@ def test_second_gateway_replaces_cached_protocol_policy_on_real_objects(monkeypa
         assert gw2.auth_status()["rejections"] == 1
     finally:
         CachingProtocol.clear_cache()
+
+
+def _bearer_gateway_with_root(refresh):
+    from ewsmcp.identity import Principal
+
+    gw = EWSGateway(make_settings(), principal=Principal(
+        mailbox="alice@corp.example", token="a.b.c", fingerprint="fa"))
+    gw._account = NS(root=NS(refresh=refresh), protocol=MagicMock(name="protocol"))
+    return gw
+
+
+def test_prove_succeeds_with_one_round_trip():
+    calls = []
+    gw = _bearer_gateway_with_root(lambda: calls.append(1))
+    gw.prove()
+    assert calls == [1]
+    gw.close()
+
+
+@pytest.mark.parametrize("error_name", [
+    "ErrorNonExistentMailbox", "ErrorAccessDenied", "ErrorInvalidSmtpAddress",
+])
+def test_prove_treats_a_refused_mailbox_as_final(error_name):
+    import exchangelib.errors as el_errors
+
+    def refuse():
+        raise getattr(el_errors, error_name)("nope")
+
+    gw = _bearer_gateway_with_root(refuse)
+    with pytest.raises(ToolError) as info:
+        gw.prove()
+    assert info.value.code == "auth_failed"
+    assert "EWS_TOKEN_MAILBOX_CLAIMS" in info.value.hint
+    gw.close()
+
+
+def test_prove_reports_transient_failures_without_condemning_the_token():
+    def down():
+        raise ConnectionError("connection reset by peer")
+
+    gw = _bearer_gateway_with_root(down)
+    with pytest.raises(ToolError) as info:
+        gw.prove()
+    assert info.value.code == "upstream_unavailable"
+    assert gw.rejected is False
+    gw.close()
+
+
+def test_prove_on_401_latches_the_gateway():
+    def unauthorized():
+        raise UnauthorizedError("Exchange rejected credentials (HTTP 401)")
+
+    gw = _bearer_gateway_with_root(unauthorized)
+    with pytest.raises(ToolError) as info:
+        gw.prove()
+    assert info.value.code == "auth_failed"
+    assert gw.rejected is True
+    gw.close()
+
+
+def test_closed_gateway_refuses_to_rebuild_an_untracked_account():
+    gw = EWSGateway(make_settings())
+    gw.close()
+    with pytest.raises(ToolError) as info:
+        gw._get_or_build_account()
+    assert info.value.code == "upstream_unavailable"
+    assert gw._cache_key is None

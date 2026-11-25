@@ -38,7 +38,12 @@ from exchangelib import (
     Credentials,
     EWSTimeZone,
 )
-from exchangelib.errors import UnauthorizedError
+from exchangelib.errors import (
+    ErrorAccessDenied,
+    ErrorInvalidSmtpAddress,
+    ErrorNonExistentMailbox,
+    UnauthorizedError,
+)
 from exchangelib.protocol import (
     BaseProtocol,
     CachingProtocol,
@@ -48,7 +53,7 @@ from exchangelib.protocol import (
 from exchangelib.transport import AUTH_TYPE_MAP
 
 from ..config import Settings
-from ..errors import AUTH_FAILED_HINT, ToolError
+from ..errors import AUTH_FAILED_HINT, ToolError, map_exception
 from ..identity import Principal
 
 logger = logging.getLogger(__name__)
@@ -62,6 +67,14 @@ BEARER_HINT = (
     "Exchange rejected the access token. Retrying with the same token will "
     "not help: obtain a fresh token for this user and call again."
 )
+MAILBOX_REFUSED_HINT = (
+    "Exchange accepted the token but will not open the mailbox named by its "
+    "claims. The operator should check EWS_TOKEN_MAILBOX_CLAIMS: the chosen "
+    "claim must hold the user's primary SMTP address."
+)
+# Exchange answered, and the answer is no: this token cannot open the
+# mailbox its claims name. Never transient, so never retried.
+_MAILBOX_REFUSED = (ErrorAccessDenied, ErrorInvalidSmtpAddress, ErrorNonExistentMailbox)
 
 
 class BearerTokenAuth(requests.auth.AuthBase):
@@ -427,6 +440,7 @@ class EWSGateway:
         )
         self._account: Optional[Account] = None
         self._account_lock = threading.Lock()
+        self._closed = False
         self._cache_key: Optional[Tuple[Any, Any]] = None
         self._owns_pool = executor is None
         self._pool = executor or ThreadPoolExecutor(
@@ -435,7 +449,12 @@ class EWSGateway:
         )
         self._slots = request_slots
         self._version = version
+        # Bearer mode: set once Exchange has accepted this token for this
+        # mailbox (see prove()); the session layer hands out the mailbox's
+        # stored state only through a proven gateway.
+        self.proven = False
         self.last_connection_error: Optional[str] = None
+        self.last_connection_exc: Optional[BaseException] = None
         self._folder_cache: Dict[str, Any] = {}
         self._folder_cache_ts = 0.0
         if settings.ews_insecure_skip_verify:
@@ -467,6 +486,13 @@ class EWSGateway:
     def _get_or_build_account(self) -> Account:
         with self._account_lock:
             if self._account is None:
+                if self._closed:
+                    # An evicted gateway must not quietly rebuild a protocol
+                    # nobody tracks; the next call gets a fresh gateway.
+                    raise ToolError(
+                        "upstream_unavailable", "This connection was closed; call again.",
+                        retry_after_s=1,
+                    )
                 self._account = self._build_account()
             return self._account
 
@@ -567,8 +593,14 @@ class EWSGateway:
         self._folder_cache.clear()
         self._folder_cache_ts = 0.0
 
+    @property
+    def closed(self) -> bool:
+        return self._closed
+
     def close(self) -> None:
         """Release everything this gateway holds (idle eviction, shutdown)."""
+        with self._account_lock:
+            self._closed = True
         self.reset()
         if self._owns_pool:
             self._pool.shutdown(wait=False, cancel_futures=True)
@@ -637,6 +669,7 @@ class EWSGateway:
                 self.last_connection_error = f"ToolError: {err.message}"
                 raise
             self.last_connection_error = f"{type(err).__name__}: {err}"
+            self.last_connection_exc = err
             logger.error("connection test failed: %s", self.last_connection_error)
             return False
         except UnauthorizedError as exc:
@@ -654,11 +687,42 @@ class EWSGateway:
                 self.last_connection_error = f"ToolError: {err.message}"
                 raise err from e
             self.last_connection_error = f"{type(e).__name__}: {e}"
+            self.last_connection_exc = e
             logger.error("connection test failed: %s", self.last_connection_error)
             return False
         finally:
             if claimed and not claim_released:
                 self._breaker.release_half_open()
+
+    def prove(self) -> None:
+        """Bearer mode: show that Exchange accepts this token for this mailbox.
+
+        One real round trip — GetFolder on the mailbox's root, which names the
+        mailbox — so success means the token is valid AND opens the mailbox
+        its own claims name. Blocking; run it on the worker pool. Raises
+        ``ToolError``: ``auth_failed`` when Exchange rejects the token (401)
+        or refuses that mailbox to it (both final for this token), and the
+        mapped transient code (``upstream_unavailable``, ``throttled``, …)
+        for anything else, which must not condemn the token.
+        """
+        self.last_connection_exc = None
+        if self.test_connection():
+            return
+        exc = self.last_connection_exc
+        if isinstance(exc, _MAILBOX_REFUSED):
+            raise ToolError(
+                "auth_failed",
+                f"Exchange will not open this mailbox for the token ({type(exc).__name__}).",
+                hint=MAILBOX_REFUSED_HINT,
+            )
+        if isinstance(exc, ToolError):
+            raise exc
+        if exc is not None:
+            raise map_exception(exc)
+        raise ToolError(
+            "upstream_unavailable", "Exchange did not answer the token check.",
+            retry_after_s=30,
+        )
 
     # ------------------------------------------------------------- calling
 

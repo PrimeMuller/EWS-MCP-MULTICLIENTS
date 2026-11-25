@@ -43,6 +43,11 @@ class Settings(BaseSettings):
     # exchangelib connection count). Exchange's own per-user EWS limit is far
     # higher; staying at 2-3 keeps a single busy assistant a polite guest.
     ews_mailbox_max_concurrency: int = Field(default=2, ge=1, le=8)
+    # A mailbox's session (connections, mirror) is closed after this long
+    # without calls; past EWS_MAX_MAILBOXES the least recently used idle
+    # sessions go first.
+    ews_mailbox_idle_seconds: int = Field(default=1800, ge=60)
+    ews_max_mailboxes: int = Field(default=2000, ge=1)
     circuit_failure_threshold: int = 5
     circuit_open_seconds: int = 60
 
