@@ -1,0 +1,1498 @@
+# Changelog
+
+## [Unreleased]
+
+## [4.5.0a4] - 2026-11-17
+
+### Added
+- **`create_draft` and `update_draft` in `v5/` accept `body_format="html"` alongside the `"text"`
+  default.**
+  - `ewsmcp.htmlsafe` runs a custom linear-time, non-raising, stdlib-only tokenizer off the event
+    loop in under 2 s for inputs up to 200,000 characters.
+  - Markup is rebuilt from scratch to a fixed point as `<html><body…>…</body></html>`, carrying
+    `dir`, `lang`, `align`, and `style` from input `<html>` or `<body>` onto `<body>`.
+  - Parsing handles omitted `</head>`, HTML5 end-tag quote rules, HTML5 raw-text elements
+    including `noembed`, `noframes`, `xmp`, and `iframe`, `/` on non-void HTML elements, implied
+    browser end tags, and combining-mark runs capped at 30.
+  - Allow-lists keep formatting, list, table, and link elements and attributes; in attribute
+    values, numeric character references decode with or without `;`, and named ones only when
+    terminated with `;` so `&region=sa` stays verbatim.
+  - Links allow only `http`, `https`, and address-only `mailto`; anchors with no visible text in
+    any descendant, table cells included, are removed, and `mailto:` query, fragment, and
+    extra-recipient parts are stripped and counted in `removed_links`.
+  - CSS keeps typography and layout declarations with normalised internal whitespace, restricts
+    `unicode-bidi` to `normal|embed|isolate|plaintext`, and drops `font-size` of `0` or
+    `< 6px/pt`.
+  - Bidi overrides `U+202D` and `U+202E`, `img`, scripts, styles, forms, embeds, `noembed`,
+    `noframes`, SVG/MathML, comments, marked sections, CDATA, and event handlers are dropped.
+  - Inputs over 200,000 characters on the input string—escaped output may be longer—or leaving no
+    visible non-blank text fail with `validation` before touching Exchange; first-pass removals
+    are reported in `sanitised`, and `update_draft` reports `body_format` only when `body` is
+    supplied.
+- **`send_draft` phase-1 previews inspect stored draft HTML and report links, destination hosts,
+  and link-mismatch warnings.**
+  - Inspection runs off the event loop in under 5 s up to 2,000,000 characters without holding
+    the GIL for more than ~0.2 s; larger bodies list hosts from the raw-text union scan only and
+    set `links_unverified: true`.
+  - Attribute scanning walks `href`, `xlink:href`, `action`, `formaction`, `src`, `srcset`,
+    `background`, `poster`, `data`, and `cite`.
+  - A parser-independent raw-text URL scan adds the union over eight readings: character
+    references with none decoded, browser rules once, browser rules to a 3-pass fixed point, and
+    all character references to a 3-pass fixed point, each with tab/CR/LF deleted and replaced by
+    a space.
+  - `link_hosts` orders mismatching link hosts first, then other link hosts, `embedded: true`
+    non-anchor hosts, and `unparsed: true` raw-scan hosts; hosts over 253 characters are cut to
+    80 without IDNA, and the list caps at 50 with `link_hosts_total` and `links_unverified: true`.
+  - `links` lists mismatching links first, up to 20 distinct `{text, href}` pairs with `text`
+    capped at 120 characters, plus `links_total`.
+  - `warnings` orders unverified and size notices first, then the singular hosts-omitted and
+    outside-normal-markup notices, then mismatch warnings—covering dot-whitespace, mixed
+    ASCII/non-ASCII link-text tokens, and `mailto:` multi-recipient or query links, shown up to
+    100 with a count line and `links_unverified: true` beyond 100—and finally non-critical
+    warnings folded beyond three per kind.
+  - Stored HTML in `_body_html` stays bound into the confirmation token.
+- **`update_draft` accepts `remove_attachments` to remove draft attachments by name or id.**
+  - Entries accept attachment names, `a`-alias ids reported by `add_draft_attachment` or
+    `update_draft`, or raw EWS attachment ids.
+  - All selectors match up front—all-or-nothing—under `_draft_lock` on items in `f:drafts` only.
+  - Unknown entries, with echoed selectors cut to 80 characters, and ambiguous duplicate names
+    fail with `validation` before writing; duplicate-name errors list the `a`-alias ids to choose
+    from.
+  - Removals run before saving `to`, `cc`, `bcc`, `subject`, or `body` and return remaining
+    `attachments`; if a multi-delete fails partway, no other fields change and the error reports
+    `removed` and remaining `attachments`.
+  - Removing an attachment invalidates any earlier `send_draft` confirmation token; `send_draft`
+    binds attachments by `name`, `size`, and `id`, not a content hash.
+- **`add_draft_attachment` accepts `message_id` to attach an existing mail message as a
+  `message/rfc822` `.eml` file.**
+  - `message_id` is mutually exclusive with `content_base64` and `path`; non-mail items and the
+    draft itself fail with `validation`.
+  - Declared `size` is checked against `EWS_MAX_ATTACHMENT_MB` before downloading `mime_content`,
+    and real size is checked again after download.
+  - `Bcc` and `Resent-Bcc` headers, folded lines included, are stripped from the attached copy.
+  - Filename sanitisation removes format and C0/C1 control characters, prefixes `_` onto reserved
+    Windows device stems `CON`, `PRN`, `AUX`, `NUL`, `COM1`–`COM9`, and `LPT1`–`LPT9`, and caps
+    stems at 120 characters and 200 UTF-8 bytes before `.eml` with `message.eml` fallback.
+  - Returns short `a`-alias attachment `id` values and invalidates any earlier `send_draft`
+    confirmation token.
+- **`get_attachment` in `v5/` extracts text in memory from PDF, Office, mail, HTML, and
+  plain-text attachments.**
+  - Implemented across `v5/ewsmcp/toolerror.py`, `v5/ewsmcp/extract.py`,
+    `v5/ewsmcp/extract_child.py`, `v5/ewsmcp/extract_worker.py`, and `v5/ewsmcp/pdftext.py`.
+  - Document formats `pdf`, `docx`, `xlsx`, `pptx`, `eml`, `message`, and `html` run in
+    `python -m ewsmcp.extract_child`, loading only stdlib, `defusedxml`, and extraction modules;
+    `pypdf` imports lazily only when a PDF arrives, never loading `exchangelib`, `mcp`, or
+    `requests`.
+  - At most `2` workers run concurrently without holding mail gateway threads, under a `20` s
+    hard wall-clock deadline and a `75%` soft deadline between pages, sheets, slides, blocks, or
+    message parts that returns `partial: true`, unit counts read, and `notes`.
+  - Each child self-applies a `1,024` MB memory ceiling before reading `stdin` via Win32 Job
+    Object on Windows or `RLIMIT_AS` on Linux, reported via
+    `get_server_status.document_memory_ceiling` with `enforced: false` when un-enforced on other
+    platforms. The parent enforces a Win32 kill-on-close Job Object or POSIX `start_new_session`
+    plus process-group `SIGKILL`, kills the child immediately on `asyncio` cancellation while
+    holding the concurrency slot until cleanup finishes, and validates child JSON as hostile
+    input.
+  - Workers use a scrubbed environment without `USERNAME`, a reduced `PATH`, and an empty
+    temporary `cwd` removed with retry after child exit; Linux marks the server process
+    non-dumpable via `prctl(PR_SET_DUMPABLE, 0)` before the first worker unless
+    `EWS_KEEP_DUMPABLE=true`, and temp-folder or worker-creation failures return `internal`
+    without opening the circuit breaker.
+  - The worker contains time, memory, and parser crashes; it is not an OS user or filesystem
+    sandbox.
+  - Plain-text files `.txt`, `.csv`, `.md`, `.log`, `.json`, and `text/*` decode and slice in the
+    server process without spawning a worker, reading only enough bytes for `5,000,000`
+    characters with no per-line loop or line-ending normalisation, stripping BOMs, and replacing
+    lone surrogates with `U+FFFD`; Outlook `.msg` files return `mode: "info"` with a
+    save-and-open note and hint in both `mode="auto"` and `mode="text"`, while existing S/MIME
+    `.p7m` and `.p7s` handling and `mode="auto"` behaviour are preserved.
+
+  | Format | Extraction behaviour and limits |
+  |---|---|
+  | `.pdf` | Optional extra `ews-mcp[extract]` / `pypdf>=6.21,<7` in `dev` and `v5/Dockerfile`; `500`-page bound; `layout` and plain-mode text with `ewsmcp.pdftext` RTL repair |
+  | `.docx` / `.docm` | Reads `mc:Choice`-only `mc:AlternateContent` |
+  | `.xlsx` / `.xlsm` | Streamed worksheets under `--- Sheet: <name> ---` up to `5,000` rows × `50` columns per sheet, `2,000` characters per cell, and `≤10`-character cell references |
+  | `.pptx` / `.pptm` | Slides under `--- Slide N ---` in presentation order |
+  | `.eml` | `compat32` policy with raw 8-bit header bytes recovered as UTF-8 falling back to `Windows-1256` before the `4,000`-character header cut, and `≤50` addresses per header |
+  | Exchange item / HTML | Attached Exchange items via `ItemAttachment` with `extracted_from: "message"`, and `.html` / `.htm` |
+
+#### `.pdf`
+
+- Optional extra `ews-mcp[extract]` / `pypdf>=6.21,<7`, installed in `dev` and `v5/Dockerfile`,
+  with a `500`-page bound.
+- Runs `layout` mode with `ewsmcp.pdftext` in-memory `/ToUnicode` multi-letter RTL ligature
+  repair and single start-string `bfrange` expansion up to `256` codes.
+- Uses unpatched plain-mode text for linear split-word repair up to `12` pieces and file-order
+  recovery when rotated text or Form `/XObject` content is invisible to `layout` mode.
+- Preserves byte-identical passthrough on layout-visible non-RTL pages.
+- Applies whole-word `Word` vs Unicode reading-order conversion up to `5,000` characters per
+  line, plus Arabic presentation-form and Persian-twin folding.
+- Reports `"no text layer"` only when both layout and plain passes are empty.
+
+#### `.xlsx` / `.xlsm`
+
+- Streams worksheets under `--- Sheet: <name> ---` up to `5,000` rows × `50` columns per sheet so
+  large worksheets still return their first `5,000` rows with a cut note.
+- Formats ISO date/time and percentage values from `xl/styles.xml`, with a fallback note if
+  unreadable.
+- Caps cell text at `2,000` characters per cell and uses `≤10`-character cell references.
+
+- **Character-offset paging on `get_attachment` serves extracted text in slices from an in-memory
+  cache with archive and XML safety bounds.**
+  - Responses include `offset`, `total_chars`, `next_offset` when more follows, `extracted_from`,
+    `pages`/`slides`/`sheets`, and `pages_read`/`slides_read`/`sheets_read`.
+  - Every part repeats `partial: true` when cut and, when present, `note` and `notes`—a list of
+    at most `8` notes of `≤300` characters, with cut notes first and repeated notes folded with a
+    count.
+  - Cache entries are keyed by `(attachment_id, size)` or an unambiguous fallback tuple; calls
+    with `offset > 0` resolve strictly via the exact `(message_id, attachment)` selector binding
+    or a single metadata-only picker lookup.
+  - Archive and XML checks enforce `defusedxml` DTD/entity rejection and return `≤300`-character
+    `validation` errors and notes echoing at most `80` characters of file-supplied text without
+    opening the circuit breaker.
+
+  | Limit | Value |
+  |---|---|
+  | Extracted text per document | `5,000,000` characters; `20,000` characters per `get_attachment` slice |
+  | In-memory document text cache | At most `4` documents and `8,000,000` characters total, `10`-minute TTL |
+  | Attachment size ceiling | `EWS_MAX_ATTACHMENT_MB` |
+  | ZIP archive members | Stored or deflated members only; `2,000` archive members checked before reading |
+  | Streamed archive / XML reads | `30` MiB per non-streamed member, `20` MiB per non-streamed XML part, `100` MiB total read |
+  | Iterative XML depth | `256` |
+
+- **`find_people` and `get_contact` return `department` and `office` on person results when
+  provided by the directory or contact record.**
+  - Adds `Contact` and `Attachment`/`ItemAttachment` field pins in
+    `test_exchangelib_signatures.py`.
+- **`search_messages(importance="high"|"normal"|"low")` filters messages by importance with
+  identical semantics on the SQLite mirror and live EWS lanes.**
+  - Combinable with `sender`, `since`, `until`, `is_unread`, `categories`, `has_attachments`,
+    `flag_complete`, `folder="f:all"`, and `recursive=true`, without calling `QuerySet.count()`
+    on large sets.
+  - Message cards and full message DTOs also emit `importance: "low"` alongside `"high"`.
+- **`get_messages(ids, format="concise"|"full", fresh=false)` at the `read` tier fetches up to 20
+  messages in one call in the exact order requested.**
+  - Resolves each id individually inside the handler, rejecting non-message aliases locally
+    without contacting Exchange and falling back to per-id fetches if batch `fetch` raises
+    mid-stream.
+  - Reports per-item failures in `failed` as `[{id, index, code, error}]` using the caller's
+    exact input id without minting aliases.
+  - Stamps `source: "mixed"` with per-item `source`, plus `as_of` on mirror rows, when mirror and
+    live hits mix.
+  - Never downloads attachment bytes: PKCS#7 S/MIME attachments report `smime_type: "candidate"`
+    from name and MIME type only, whereas `get_message` provides the confirmed `"signed"` or
+    `"enveloped"` classification.
+- **`list_folders(query="...")` matches folder names or full paths by case-insensitive substring
+  across the folder tree on both the mirror and live lanes.**
+  - Searches the entire folder tree on the mirror or live lane when `parent` is omitted; when
+    `parent` is set, walks `parent`'s subtree live while still ignoring `depth` and returning full
+    root-anchored paths.
+  - Rejects empty or whitespace-only `query` strings with `validation`.
+- **`get_message(format="eml")` saves a message's RFC-822 `mime_content` exclusively under
+  `DATA_DIR/attachments` and returns only `saved_path` and `size_bytes`.**
+  - Shares file-writing behaviour with `get_attachment(mode="save")`: never overwrites existing
+    files, adds `-2`, `-3`, … suffixes, caps filename stems at 200 UTF-8 bytes on a character
+    boundary, guards reserved device stems, and reports local disk failures as `internal` without
+    tripping the Exchange circuit breaker.
+  - Enforces the `EWS_MAX_ATTACHMENT_MB` ceiling before and after fetching MIME bytes.
+  - A message exported from Sent Items may contain its `Bcc` header because the file is the
+    message as the mailbox holds it.
+  - Adds `Item.importance` and `Item.mime_content` field and projection pins in
+    `test_exchangelib_signatures.py`.
+
+### Changed
+- **`cancel_event` in `v5/` inspects the calendar entry in a single projected fetch per phase and
+  fails closed when item type or organizer ownership is not verified.**
+  - Non-`CalendarItem` items fail with `validation`.
+  - Cancellation `attendees` pass through the dispatcher's recipient guard and external-recipient
+    warning.
+  - Recurring series masters with `type="RecurringMaster"` are flagged in the preview with
+    `series: true`, `scope: "series"`, and a warning `note`.
+  - Binds `start`, `end`, `type`, `series`, `action`, `is_meeting`, `attendees`, `subject`, and
+    `message` into the confirmation token; tool count, class, tier, and two-phase confirmation
+    are unchanged.
+
+  | Response type | `is_meeting` and attendee lists | Outcome |
+  |---|---|---|
+  | `my_response_type="Organizer"` | `is_meeting` is true or any attendee list is non-empty | Cancels the meeting |
+  | `my_response_type="Organizer"` | `is_meeting` is false and all attendee lists are empty | Moves to Deleted Items with `SEND_TO_NONE` and `deleted: true` |
+  | `my_response_type="Organizer"` | `is_meeting` is missing and all attendee lists are empty | Fails with `validation` |
+  | `Accept`, `Decline`, `Tentative`, `NoResponseReceived` | Any | Fails with `validation` pointing to `respond_to_event` |
+  | `Unknown` or missing | `is_meeting` is explicitly false and all attendee lists are empty | Moves to Deleted Items with `SEND_TO_NONE` and `deleted: true` |
+  | `Unknown` or missing | `is_meeting` is true | Compares the organizer's SMTP address against the account's own addresses: ours cancels, foreign fails with `validation` pointing to `respond_to_event`, missing or non-SMTP fails with `validation` |
+  | `Unknown` or missing | `is_meeting` is missing, or `is_meeting` is false with attendees | Fails with `validation` |
+
+- **The default `v5/` tool surface grows from 33 to 34 tools with `get_messages`.**
+  - Exposes **18** tools at `read`, **29** at `draft`, and **34** at `full`.
+  - Exposes **35** tools when the semantic tier is enabled, keeping the ≤35 design cap.
+- **Notifying calendar calls in `v5/` now enforce `SEND_ENABLED` at phase one, preview stored
+  attendees on `update_event`, and count toward `EWS_MAX_SENDS_PER_HOUR`.**
+  - `create_event(send_invitations=true)`, `update_event(notify_attendees=true)`, and
+    `cancel_event` on a meeting with attendees are now refused with `kill_switch` at phase one
+    while `SEND_ENABLED=false`, before any token is issued. Silent calendar edits and appointment
+    deletions without attendees are not affected.
+  - `update_event(notify_attendees=true)` now returns a phase-one `preview` with `event_id`,
+    current `subject`, `start`, `end`, `type`, `scope` when given, `attendee_count`, stored
+    `attendees`, and `changes`, showing a new body as a 200-character `body_snippet`.
+  - Stored attendees on `update_event(notify_attendees=true)` are checked at phase one against
+    `EWS_RECIPIENT_ALLOWLIST` and `EWS_RECIPIENT_DENYLIST`, failing with `recipient_blocked` when
+    disallowed and listing external addresses under `warnings`.
+  - `update_event(notify_attendees=true)` binds the event's `subject`, `location`, `start`, `end`,
+    `type`, `attendees`, `notify_attendees`, and every requested change, full `body` included, into
+    `confirm_token`, failing with `confirm_invalid` at phase two if the event changed.
+  - Confirmed invitations, update notices, and meeting cancellations now count toward the
+    in-memory per-process `EWS_MAX_SENDS_PER_HOUR` cap alongside `send_draft`, `respond_to_event`,
+    and `set_oof`.
+
+### Fixed
+- **Docker and development commands in `v5/README.md` now target `v5/`, reported in #164.**
+  - Running `docker build .` from the repository root, where the quick start leaves you, built
+    the legacy 4.0 image; the Docker example now builds the image from `v5/`.
+  - Development commands state that they run from `v5/`.
+- **HTML-to-text conversion for fallback message and calendar bodies, out-of-office texts, and
+  HTML attachments no longer depends on Python's `html.parser`.**
+  - On Python older than 3.11.14, 3.12.12 or 3.13.6 (the fix of that module shipped in those
+    releases), a body made of thousands of unterminated tags took seconds to minutes to convert;
+    conversion is now linear and returns the same text on every build.
+  - Mail without malformed markup converts as before across 900 recorded cases.
+  - Outlook-written mail whose head Exchange returns with a comment ending inside `<style>` no
+    longer gets a stray `<![endif]-->` or its title printed at the top of the text, and outside
+    `<svg>` and `<math>` the content of `<title>` is never shown.
+  - Hidden regions end where a browser ends them, preserving text after an unclosed `<head>`, a
+    `<![CDATA[` wrapper, a raw-text element such as `<textarea>` or `<iframe>`, a script
+    containing `<!--<script>`, or style and script elements inside `<svg>` and `<math>`.
+  - Markup left unterminated at the end of a body is dropped instead of shown as text, and HTML
+    attachments report a cut only when text was really cut.
+  - The converter is a reading aid, not a renderer; its limits are listed in `v5/DESIGN.md`.
+- **`SEND_ENABLED=false` now stops `cancel_event` from sending meeting cancellation notices.**
+  - Through `v4.5.0a3`, `SEND_ENABLED` did not stop a confirmed `cancel_event` from sending
+    cancellation notices with the caller's `message` to attendees.
+  - `ToolSpec.sends_mail` via `notifies` now refuses `cancel_event` with `kill_switch` at phase
+    one when the previewed `action` is `"cancel"`, backed by a second check in `_cancel_event`.
+    Appointments without attendees where `action` is `"delete"` still move to Deleted Items.
+- **`update_event(notify_attendees=true)` now checks stored attendees against the recipient allow
+  and deny lists.**
+  - Through `v4.5.0a3`, update notices went to the attendees stored on the event without checking
+    `EWS_RECIPIENT_ALLOWLIST` or `EWS_RECIPIENT_DENYLIST` and without external-recipient
+    `warnings`.
+  - Phase one now fetches required, optional, and resource attendees from the event, refuses
+    disallowed addresses with `recipient_blocked` before saving, and lists external recipients in
+    `warnings`.
+- **Invitations, update notices, and meeting cancellations are now counted by
+  `EWS_MAX_SENDS_PER_HOUR`.**
+  - Through `v4.5.0a3`, invitations from `create_event`, update notices from `update_event`, and
+    cancellations from `cancel_event` were not counted by the hourly cap.
+  - Every confirmed call that sends mail now shares the per-process hourly window and fails with
+    `rate_capped` and `retry_after_s` of at least `1` when the hour is full.
+- **A confirmed sending call refused with `rate_capped` now keeps its `confirm_token`.**
+  - Through `v4.5.0a3`, phase two consumed `confirm_token` before checking
+    `EWS_MAX_SENDS_PER_HOUR`, spending the token of the refused call.
+  - Phase two now verifies the token, rejects spent tokens with `confirm_invalid`, reserves the
+    send-cap slot, and consumes the token last, releasing the slot if a concurrent call spent the
+    token first. The same `confirm_token` works once the hour has room if it has not expired.
+  - Spent-token records are kept `5` s past expiry via `CONSUMED_GRACE_SECONDS` so a used token
+    stays refused through the end of its lifetime.
+- **`get_server_status`, `waiting_on`, and `find_similar` now answer while the circuit breaker is
+  open.**
+  - Through `v4.5.0a3`, an open circuit breaker refused every tool with `upstream_unavailable`,
+    `get_server_status` included.
+  - The breaker gate now refuses only tools with `requires_ews=true`. While open,
+    `get_server_status.connection` adds `circuit_open: true` and `retry_after_s`, and omits both
+    keys otherwise.
+- **Attachment `a`-alias ids from the draft tools now select the right attachment in
+  `get_attachment`.**
+  - Through `v4.5.0a3`, `get_attachment` read `a<digits>` as a zero-based index, and the draft
+    tools returned no attachment ids. With the `a` ids the draft tools return in this release,
+    `get_attachment` resolves the id to the attachment it was issued for.
+  - `get_attachment` now resolves `attachment` in order: case-insensitive file name, minted
+    `a<digits>` alias resolved to the attachment it was issued for, raw Exchange attachment `id`,
+    and zero-based digit index. A minted `a<digits>` alias from another message fails with
+    `not_found` instead of being read as an index, while unminted `a<digits>` still reads as a
+    zero-based index.
+- **Stored attendees without an address on `update_event(notify_attendees=true)` and
+  `cancel_event` are now shown in `attendees_without_address` and refused with
+  `recipient_blocked` when a recipient list is configured.**
+  - Through `v4.5.0a3` neither tool listed or checked the attendees stored on the event.
+  - Phase-one previews on meetings with attendees now list stored attendees that have only a
+    display name, such as personal distribution lists, under `attendees_without_address` next to
+    `attendees`.
+  - When `EWS_RECIPIENT_ALLOWLIST` or `EWS_RECIPIENT_DENYLIST` is set, phase one refuses the call
+    with `recipient_blocked`; with neither list set, the call proceeds.
+- **A recipient argument (`to`, `cc`, `bcc`, `attendees`) that is neither a string nor a list of
+  strings is refused with `validation`.**
+  - Checked by the dispatcher before any Exchange call, whether or not a recipient allow or deny
+    list is set.
+
+## [4.5.0a3] - 2026-11-16
+
+### Added
+- Server-side Exchange Inbox rules in `v5/` (`list_rules` at `read`, stamped `source: "live"`; `save_rule` and `delete_rule` at `draft`, serialised in-process and always two-phase confirmed) with `r`-alias ids (`rule_id` → `r`). Writable actions are strictly allow-listed to mailbox-internal filing and metadata (`move_to_folder`, `copy_to_folder`, `assign_categories`, `mark_as_read`, `mark_importance`, `stop_processing_rules`); rules that forward, redirect, auto-reply, delete, or use unsupported predicates, exceptions, unreadable XML elements, or unnameable targets are reported `editable: false` with `unsupported` (and `sends_mail` / `recipients` when sending) and refused on wholesale replace. On replace, omitting `priority` or `enabled` preserves the current rule's values and the preview reports changed fields in `changes`.
+- Fail-closed Deleted Items / Junk Email and live folder-ancestry verification for `save_rule`: `move_to_folder` and `copy_to_folder` refuse Deleted Items, Junk Email, and any subfolder below them (matched by class, distinguished id, `WELL_KNOWN` name, or raw id), fail closed if discard folder ids cannot be determined, walk live `parent_folder_id` ancestry up to `msg_folder_root` (bounded to 25 levels), and always send a real `FolderId` bound into the confirmation token alongside a SHA-256 XML fingerprint of any replaced or deleted rule.
+- Direct EWS rule write handling (`CreateInboxRule`, `SetInboxRule`, `DeleteInboxRule`): completed writes degrade to `ok: true, verified: false` if read-back fails, and deleting a disabled rule that Exchange rejects with `ErrorItemNotFound` safely neutralises the rule with a 48-character random subject token + `stop_processing_rules` before deleting it.
+- `list_rules` reads `<m:OutlookRuleBlobExists>` from `GetInboxRules` as top-level `outlook_only_rules` (`true|false|null`), and `save_rule` / `delete_rule` warn in phase-1 previews before EWS `RemoveOutlookRuleBlob=true` would discard rules disabled in Outlook or client-side send rules (and when a rule has no conditions).
+
+### Changed
+- Upgraded `v5/` dependency pin from `exchangelib==5.0.3` to `exchangelib==5.6.0` (updating the `FolderCollection.view` signature pin and adding inbox-rule service/model pins). Legacy `src/` keeps its existing pin.
+- Default `v5/` tool surface grows from 30 to **33** tools (**17** at `read`, **28** at `draft`, **33** at `full`; design cap raised from 30 to 35).
+
+### Fixed
+- Only one `ewsmcp` process per `DATA_DIR` runs the background `SyncEngine`: the leader holds a non-blocking OS file lock on `cache/sync.lock` for the life of the process while other processes on the same `DATA_DIR` read the shared SQLite mirror as followers (`get_server_status.cache.sync.role`: `"leader"` | `"follower"`), skip `EWS_CACHE_PURGE_ON_BOOT` with a warning, and retry the lock every 30 seconds to take over when the leader exits instead of multiplying Exchange delta syncs and triggering server throttling (degrading to running sync with a single logged error if `sync.lock` cannot be opened).
+
+## [4.5.0a2] - 2026-11-13
+
+### Added
+- `list_folders` rows expose `folder_class`, the raw EWS `FolderClass` string (`IPF.Note`, `IPF.Appointment`, `IPF.Contact`, …), on both the cache and live lanes (omitted when Exchange reports none); existing local mirrors gain `folders.folder_class` on open and populate it on the next hierarchy sync.
+- `get_attachment` and `get_message` sniff `smime.p7m` (`application/pkcs7-mime`) attachments via the DER `ContentInfo.contentType` OID (RFC 5652, stdlib only) and report `smime_type: signed|enveloped`; `get_attachment(mode="auto")` decodes `signed` payloads as text and leaves `enveloped` payloads as `info` with a private-key hint.
+- `create_event` and `update_event` accept `reminder_minutes` (`-1` removes a reminder), and `get_event` returns it.
+- Recurring calendar events: `create_event` accepts `recurrence` (`daily`, `weekly`, or `monthly`, with `interval`, `weekdays`, `until`, or `count`) in the server's named timezone so series keep their wall-clock time across DST changes; `get_event` returns the series rule and `type`, and `update_event` accepts `scope="series"` (required when editing a series master id).
+- `create_event` reports `invitations_pending` when an event with attendees is saved without sending invitations, and `get_event` shows `invitations_sent` to the organizer.
+- `check_messages` checks a list of subjects or senders (comma- or newline-separated string, JSON array string, or string array) against a folder in one call and returns matching messages and missing values.
+- `search_messages` accepts `folder="f:all"` to search mail folders across the mailbox (excluding deleted items, junk, drafts, and outbox), merging hits newest first with each hit's `folder` plus `folders_searched` and `folders_failed`, as well as `categories` and `flag_complete` filters (with `flag_complete` completion state writable via `update_messages`).
+- Draft file attachments: `create_draft` accepts `attachments` and the new `add_draft_attachment` tool adds a file to an existing draft (`filename`, `content_base64`, optional `content_type`; 30 tools total, `mcp>=1.30`); `send_draft` lists attachments in its preview.
+- Draft attachments by `path` from one operator-configured directory (`EWS_ATTACHMENT_DIR`, off by default), next to `content_base64`.
+- `EWS_MAX_ATTACHMENT_MB` (1 to 50, default 25): per-call attachment ceiling; the HTTP body limit follows it.
+- Folder names `sentitems`, `deleteditems`, `junkemail` are accepted wherever a folder is named.
+- The `send_draft` confirm token also binds the attachment ids (alongside names and sizes).
+
+### Changed
+- The authentication breaker's cap counts rejected submissions, including requests already in flight when the first 401 arrived, so a burst can reach the cap at once. That is deliberate: submissions are what a directory's lockout counter counts.
+- `ews_tz` now defaults to `"UTC"` — set `EWS_TZ` if you relied on the old default.
+- Replaced the host-specific Compose file with `v5/docker-compose.example.yml` (loopback port, `read` tier, sends off, data volume, `/livez` health check).
+- Multi-folder searches (`f:all`, `recursive`) are bounded: at most 200 folders per call (the rest reported as `folders_skipped`) and `offset + limit` at most 500; a throttled folder fails the call as `throttled`; cancellation propagates.
+- `total_available` for `flag_complete=false` is null (counting it walks nearly the whole folder); `next_offset` says whether more exist.
+- `get_message` reports `flag_complete` only when read live (`fresh=true`).
+- CI: the lint rule set is pinned in `v5/pyproject.toml`, so a new ruff release cannot turn the gate red on an untouched tree.
+- Repository documentation layout: root `README.md` acts as a single front door (version guide and stdio-first quick start), `docs/README.md` maps all documentation, the 4.0 guides live under `docs/legacy/`, and `v5/docs/API.md` includes a generated per-tool parameter reference drift-checked by `dump_tool_table.py`.
+- Removed legacy shell helper scripts (`run.sh`, `scripts/build.sh`, `scripts/deploy.sh`, `scripts/setup.sh`, `scripts/setup-basic-auth.sh`) and redundant `.env.*.example` templates so one template per line remains (root `.env.example` for 4.0 and `v5/.env.example` for 4.5).
+- README, API reference, design notes and the contributor guide brought up to date for 4.5.0a2 (operator notes for `auth_failed`, upgrade notes, a caution for the 4.0 line).
+
+### Fixed
+- `send_draft` sends exactly what was previewed: the confirm gate hands the handler the hash it verified, the handler fetches the draft once, re-checks the hash on that object and sends that object; a draft changed after the preview is refused with `confirm_invalid`. Draft tools (`update_draft`, `add_draft_attachment`, `delete_draft`, `send_draft`) are serialised per draft. Before, a change landing between verification and sending went out unreviewed.
+- `update_draft` refuses items outside Drafts, like the other draft tools.
+- A tool call that completed is no longer reported as `auth_failed` because another call saw a 401 at the same time.
+- A 401 that says the account is locked out is counted and raised at once even when the response also carries `Connection: close` (the library would report it as a busy server and retry).
+- Only an authenticated round trip closes the authentication breaker: after the cooldown the next call probes first, so a call answered from memory can no longer reset the count.
+- Lockout-guard edge cases found in a second review: a half-open call does not probe if a rejection landed while it was queued; a probe that overlaps another thread's rejection is not reported as warm; a 401 swallowed inside a tool function and followed by another error is still `auth_failed`; listing well-known folders stops at the first rejection instead of asking four more times.
+- After a 401 inside a tool call the connection manager always arms one recovery probe after the cooldown, also with the heartbeat disabled; a half-open probe keeps its claim until the worker finishes.
+- `set_oof`, `create_event` and `update_event` accept times with an explicit non-zero UTC offset (they failed with `UnknownTimeZone`): aware inputs are converted to the configured named zone.
+- `update_messages(flag_complete=false)` only clears a completed flag; an open follow-up flag is left alone.
+- Draft and reply fetches request only the fields they use, so a draft's attachments and MIME content are no longer downloaded on every draft operation.
+- `search_messages` with `sender` on `folder="f:all"` or `recursive=true` returns every match across pages, with the same paging contract as a single folder.
+- `check_messages` takes one folder only, cancels the remaining searches on the first failure and fetches four fields per message.
+- All-day events appear in the mirror on each of their days, including the last.
+- `get_attachment` applies the 5 MiB S/MIME sniff cap in `mode="info"` and `mode="auto"`.
+- `recursive=true` rooted at Deleted Items, Drafts, Junk or Outbox walks that subtree.
+- All-day calendar items no longer return `start`/`end` as null when exchangelib hands back `date` objects: they format as `YYYY-MM-DD`, event cards set `all_day: true`, and the cache mirror stores midnight in the server timezone.
+- OAuth discovery and registration paths (`/.well-known/oauth-*`, `/register`) return 404 instead of inheriting the `MCP_API_KEY` gate's 401 so clients treat OAuth as unsupported; clients that probe `/mcp` unauthenticated before attaching headers should omit `MCP_API_KEY` and rely on network isolation (`x-api-key` on `/api/tools/<name>` is unaffected).
+- A password that Exchange rejects is no longer resubmitted. An HTTP 401 now fails at once (`RejectingFaultTolerance` raises `UnauthorizedError`, mapped ahead of throttling without `"401"` substring false positives while preserving retries on 503 and SOAP busy) instead of being retried as throttling; an authentication circuit breaker in `EWSGateway` blocks every path to Exchange (tool calls, warm-up, heartbeat, background sync) for `EWS_AUTH_FAILURE_COOLDOWN_SECONDS` (default 900) and stops permanently after `EWS_AUTH_MAX_REJECTIONS` (default 3) until the process restarts. New connection state `auth_failed` on `/readyz`, `/metrics`, and `get_server_status`; tools answer `auth_failed` with a hint that retrying will not help. Closes the account-lockout path reported in #161 across every mode.
+- An empty `EWS_AUTH_TYPE_FORCE` is treated as unset instead of failing start-up.
+- `EWS_AUTH_TYPE_FORCE=ntlm` works: the setting was handed to exchangelib as is, whose NTLM constant is upper-case, so a forced NTLM failed validation before any request was sent.
+- On a 401 the log names the authentication schemes the server offered (`WWW-Authenticate`) next to the configured one without logging credentials.
+- `get_message` and `get_attachment(mode="info")` no longer download attachment bytes for ordinary files; S/MIME sniffing reads only PKCS#7 candidates, off the event loop (up to 5 MiB in `get_message`).
+- `check_messages(field="sender")` asks Exchange (AQS `from:`) on the live lane instead of scanning only the newest 50 messages; whole-word matching also applies to sender names; `values` accepts an array of strings as documented; `fresh` and provenance stamps added.
+- `search_messages(recursive=true)` returns hits newest first across folders with a correct offset: it now runs on the same per-folder search and merge as `folder="f:all"`, labels each hit with its folder, and reports `folders_searched` / `folders_failed`.
+- `flag_complete=false` is applied on whole-mailbox and recursive searches (it was silently dropped there).
+- `check_availability` free/busy window and results are anchored on the Exchange timezone (#141, closes #150); regression tests added.
+- The legacy 4.0 tree: `create_reply_draft(reply_all=true)` keeps the original `Cc` in `Cc` instead of promoting it to `To`, and no longer loses it when the caller adds `Cc` (#138).
+- `create_draft(mode="reply_all")` removes the mailbox's own address from `To` and `Cc`, drops `Cc` entries already in `To`, and adds the caller's `to`, `cc`, `bcc` instead of discarding them.
+- `set_oof(state="scheduled")` validates `start`/`end` before calling Exchange and sends the window in UTC; the result reports `start` and `end`.
+- Recipient allow/deny lists normalise each address (whitespace, case, `Name <address>`) before matching; a malformed recipient is a `validation` error when a list is configured.
+- `get_event` no longer fails on an occurrence whose series master is not in the mailbox; `update_event(scope="series")` works on all-day series.
+- `mail_folders` tolerates a mailbox without one of the well-known folders.
+
+## [4.5.0a1] - 2026-07-11 (pre-release; the `v5/` tree)
+
+The greenfield server (`v5/ewsmcp`, package `ews-mcp` 4.5.0a1) reaches
+alpha: consolidated 28-tool surface, alias-only ids, token-lean DTOs, and
+a cache-first local mirror. Ships side-by-side with v3 — nothing in
+`src/` changes. Full reference: `v5/docs/API.md`; architecture:
+`v5/DESIGN.md`.
+
+### Fixed (v5 pre-release criticals)
+- `get_thread` passed a string `conversation_id` to `filter()` —
+  exchangelib 5.0.3 requires the `ConversationId` object (the tool was
+  100% broken; the old unit test pinned the broken behavior).
+- Recipient allow/denylists were dead code: they now fire on every tool
+  whose arguments carry recipients AND on the draft's resolved
+  recipients inside `send_draft`.
+- `send_draft` confirmation is content-bound (ported from v3.5): the
+  token hashes subject + sorted recipients + full body and phase 2
+  refetches and re-verifies — editing a draft between preview and
+  confirm invalidates the token. Tokens are single-use.
+- The connection probe read a cached property and reported warm forever;
+  it now performs a real round trip every time, and `reset()` evicts
+  exchangelib's protocol cache so auth genuinely renegotiates.
+
+### Added
+- Cache-first mirror: background EWS delta-sync into per-mailbox SQLite
+  (WAL, single-writer, FTS5), cleaned bodies stored once, provenance
+  stamps (`source`/`as_of`) and a `fresh` escape hatch on every read.
+- Arabic-correct search: one normalization for index and query
+  (diacritics, tatweel, alef/hamza/teh-marbuta/alef-maqsura folds,
+  Arabic-Indic digits) — gated by a mandatory test suite.
+- New tools: `get_contact`, `list_tasks`, `update_task`, `waiting_on`
+  (sent threads with no reply), and `find_similar` when the optional
+  pgvector/Ollama semantic tier is enabled (`EWS_SEMANTIC_INDEX`).
+- Prometheus `/metrics`; audit-chain persistence across restarts + a
+  verifier script; per-sender learned-signature stripping; REST-shim
+  schema validation, body cap and disconnect handling.
+- Structural guards: exchangelib signature/behavior pins, lazy-import
+  sentinel, envelope contract, north-star budget test (≤2 calls / <2k
+  tokens for "last email from X → reply as draft").
+
+### Performance
+- `QuerySet.count()` eliminated from every list path (lookahead
+  pagination; exact totals only where cheap); field projections on all
+  bulk fetches; server-side calendar expansion caps; alias mints batched
+  off the event loop; audit writes off the event loop.
+
+### Removed / changed (vs the 67-tool v3 surface)
+- Draft-first only: no one-shot send tools. Impersonation, OAuth2,
+  folder/contact management, MIME export and the server-side
+  agent-secretary stack are intentionally dropped (see `v5/docs/API.md`
+  for the full rename map and rationale).
+- `update_messages.set_flag` removed from the schema (the backend has no
+  first-class flag field; categories are the marker).
+- `search_messages.from_` deprecated in favor of `sender`.
+
+## v4.0.1 — 2026-05-03
+
+### `?api_key=` query-param auth — Claude Desktop UI compatibility
+
+The Claude Desktop "Custom Connector" dialog exposes a URL field and OAuth
+fields (Client ID + Secret), but **no field for a static `Authorization:
+Bearer` header**. Until v4.0.0 the only way to use the v4 server from
+Claude Desktop was via `mcp-remote` (a CLI adapter) plus a hand-edited
+`claude_desktop_config.json` — needlessly clunky for a local install.
+
+`_authorized_request()` now accepts the same key over **three** transports:
+
+1. `Authorization: Bearer <key>`  (preferred — RFC-6750)
+2. `X-API-Key: <key>`             (legacy header)
+3. `?api_key=<key>` query param   (NEW — Claude Desktop UI fallback)
+
+The query param is only consulted as a last resort and is constant-time
+compared via `hmac.compare_digest`, identical to the header path. A new
+helper `redact_url_query_secrets()` masks any `api_key` / `token` /
+`secret` value before a URL is written to a log line — currently no log
+path includes URLs, but the helper exists as a guardrail for future work.
+
+**To use it**: set `MCP_API_KEY=<your-token>` in the container's `.env`
+(unchanged), then in Claude Desktop's Custom Connector dialog paste:
+
+```
+http://<host>:8000/sse?api_key=YOUR_TOKEN
+```
+
+Leave the OAuth Client ID / Secret fields blank. No JSON, no adapter.
+
+This is a v4.x stop-gap. Proper OAuth 2.0 with PKCE will land in v4.1.0;
+the query-param transport will remain for backward compatibility.
+
+Verified locally against malformed input, URL-encoded values, and the
+redaction helper before deploy. The repo intentionally ships without a
+test directory (per the v4 cleanup); the dev kit is private.
+
+### `&gt;` no longer renders literally on recipient side
+
+**Bug**: when the user (or skill) called `reply_email` / `forward_email` /
+`create_reply_draft` / `create_forward_draft` with `body_format="html"` and
+a body that contained pre-encoded HTML entities but no tags
+(e.g. `"Stage 1 &gt; Stage 2"`, `"Approved &rarr; next stage"`, `"&copy; 2026"`),
+the recipient saw the entity rendered **as literal text** — `&gt;` instead of `>`.
+
+**Cause**: `utils.format_body_for_html()` decided "is this HTML?" by looking
+only for opening/closing tags. An entity-only body slipped past the
+heuristic, was treated as plain text, and ran through `escape_html()` —
+which escaped the leading `&` to `&amp;`, turning `&gt;` into `&amp;gt;`.
+HTML mail clients then rendered that as the literal four-character string `&gt;`.
+
+This is a sibling of the v3.4 thread-header `&amp;` cascade fix — same shape
+(double-escape), different surface (body content rather than the From/To
+header strip).
+
+**Fix**: `format_body_for_html()` now also detects valid HTML entities
+(`&amp;` / `&gt;` / `&#960;` / `&#x2014;`). Any body containing one is
+treated as HTML and routed to `sanitize_html()` rather than `escape_html()`.
+
+**Plus**: `create_reply_draft` and `create_forward_draft` were silently
+ignoring the `body_format` parameter — they had no schema for it and
+never called `compose_body`. Markdown bodies were getting plain-text
+escaped, so headings/lists/code blocks didn't render. They now mirror the
+send-tool path: schema includes `body_format`, and `compose_body()` runs
+when it is `markdown` / `text`.
+
+Verified locally against the full set of entity types (`&gt;` / `&amp;` /
+`&#960;` / `&#x2014;` / `&copy;`), the plain-text-with-`<` no-regression
+case, and the full-pipeline reproduction before deploy.
+
+## v4.0.0 — 2026-05-03
+
+The first **bidirectional body format** release. The MCP now accepts
+markdown from the LLM on the write path and emits markdown to the LLM on
+the read path — Outlook keeps getting and sending HTML on its side.
+Token cost on a typical Outlook MSO body drops ~12× compared with the
+v3.4 `body_html` default.
+
+This release also draws the **MCP / skill boundary** more clearly: the
+MCP does deterministic data work (fetching, transforming, embedding,
+extracting, persisting). The consuming skill / agent does the reasoning
+(classification, summarisation, generation, decision-making). Five LLM-
+proxying tools have been removed because the skill already has an LLM
+loaded and can do that work in the same conversation, without a second
+round trip and without the MCP needing an `AI_MODEL` configuration for
+those features.
+
+### Added
+
+- **`format=html|markdown|text` on `get_email_details`** (default `html`,
+  no breaking change). `markdown` runs the Outlook MSO body through
+  `markdownify` server-side with an MSO-aware strip list, caches the
+  result in SQLite forever (Exchange messages are immutable post-send),
+  and returns ~12× fewer tokens for the same semantic content. When
+  `format!="html"`, the heavy `body_html` field is also dropped from
+  the response so the headline byte saving is real, not theoretical.
+  Companion booleans:
+  - `trim_quoted=true` strips `On …, X wrote:` history out of the body.
+  - `include_body=false` drops both `body` and `body_html` for
+    list-style calls where the agent only wants the envelope.
+- **`format=` schema on `read_emails`** (acknowledged but no
+  functional change in v4.0 — `read_emails` returns only short
+  previews so the conversion has nothing to convert; the schema is
+  in place so v4.1 can extend the rendering uniformly across the
+  list-style tools without further breaking changes).
+- **`body_format=html|markdown|text` on `send_email` / `reply_email` /
+  `forward_email`** (default `html`, no breaking change). When set to
+  `markdown`, the LLM-supplied body is converted to HTML via Python-
+  Markdown before being handed to EWS. The signature-preservation path
+  on `reply_email` / `forward_email` is unchanged — Outlook's signature
+  with its inline cid: image refs still appears at the bottom of the
+  rendered email. Acceptance criterion verified live:
+  `inline_attachments_preserved: 3` on a markdown reply.
+- **Unified per-mailbox SQLite cache** at
+  `data/ews_mcp_<mailbox>.sqlite`. Single file, three tables:
+  `body_format_cache`, `attachment_text_cache`, `embedding_cache`.
+  No vector-database dependency required.
+- **One-shot legacy migration**: on first startup, if a v3.4
+  `data/embeddings/embeddings.json` is present, it is read once,
+  imported into the new `embedding_cache` table (typically against
+  `nomic-embed-text` model). Idempotent. The legacy file is left in
+  place so the existing JSON-based EmbeddingService continues to
+  work; SQLite is wired in at the same time as a parallel cache, and
+  becomes authoritative once the read path is rewired (also in v4.0).
+
+- **Expanded `read_attachment` text extraction**:
+  - `pptx` — slide-by-slide via `python-pptx`, including speaker notes and embedded tables
+  - `msg` — Outlook compound-file via `extract-msg`. Returns subject/from/to/cc/date envelope, body (HTML→markdown if present), and a recursive nested-attachment listing. Solves the very common "user forwarded an entire thread as a .msg attachment" workflow.
+  - `eml` — RFC-822 via stdlib `email`. Same shape as `.msg`.
+  - `html` / `htm` — markdownify, RTL-safe (Arabic / Hebrew preserved)
+  - `csv`, `log`, `json`, `xml`, `md` — BOM-aware UTF-8/UTF-16 decode
+  - The pre-v4 PDF / DOCX / XLSX / TXT paths are unchanged.
+
+- **Issue #112 — Exchange ID handling**. `is_exchange_folder_id()` recognises both `AAMk` and `AQMk` prefixes. `move_email` and `copy_email` resolve `destination_folder_id` directly via `find_folder_by_id` instead of the path/name resolver. `copy_email` no longer returns empty `copied_message_id` when exchangelib hands back a bare `ItemId`.
+
+- **Issue #114 — Outlook categories on 9 create/update tools**. New optional `categories: list[str]` parameter on `create_appointment`, `update_appointment`, `create_task`, `update_task`, `create_contact`, `update_contact`, `create_draft`, `create_reply_draft`, `create_forward_draft`. Replace-on-update semantics; empty list clears. (`update_email` already supported it in v3.4.)
+
+- **Issue #115 — `is_flagged` filter on `search_emails`**. New boolean filter mapping to `PR_FLAG_STATUS` extended property. Wired into both quick and full-text search modes.
+
+- **Issue #119 — `cc` / `bcc` on `create_reply_draft`**. Caller-supplied recipients now persist on the saved draft (was silently dropped). Deduplicated against auto-derived `to_recipients`. Surfaced on the response.
+
+- **Issue #121 — `oof_settings` set-path correctness**. Existing replies are preserved when caller omits them (was overwriting with default text). Scheduled `start`/`end` are normalised to UTC before EWS (fixes `InvalidScheduledOofDuration` on PBS Exchange). `currently_active` is returned by the set path too.
+
+### Removed
+
+- `classify_email`, `summarize_email`, `suggest_replies` — pure LLM
+  reasoning that the consuming skill should do natively. See README
+  migration table for replacements.
+- `extract_commitments` — LLM extraction; skill detects + calls
+  `track_commitment` (manual CRUD remains).
+- `build_voice_profile` — LLM analysis; skill analyses + persists via
+  the memory KV (`get_voice_profile` remains for read-back).
+
+### Changed
+
+- **`AI_MODEL` is now optional**. The only remaining MCP-side LLM call
+  is the embedding model for `semantic_search_emails`, which uses
+  `AI_EMBEDDING_MODEL`. With the 5 reasoning tools removed, no chat
+  model is required.
+- **Tool count: 70 → 67**. Tool surface listed in the README.
+
+### Engineering
+
+- New module `src/body_format.py` — `render_body` (HTML→markdown),
+  `compose_body` (markdown→HTML), `trim_quoted`, plus the schema
+  fragments `READ_FORMAT_SCHEMA` / `WRITE_FORMAT_SCHEMA` so the new
+  parameters declare uniformly across every tool that uses them.
+- New module `src/cache/sqlite_cache.py` — `SQLiteCache` wrapper with
+  WAL journaling, packed `float32` embedding storage, and the legacy
+  JSON importer.
+- `EmbeddingService` rewired to consult SQLite before the network. Lookup order: in-memory dict → SQLite (bulk fetch via `get_embeddings_bulk`) → embed provider. JSON write-path is bypassed when SQLite is wired.
+- ~1100 lines of unreachable code dropped: the 5 LLM-reasoning tool class bodies (`ClassifyEmailTool`, `SummarizeEmailTool`, `SuggestRepliesTool`, `ExtractCommitmentsTool`, `BuildVoiceProfileTool`).
+- Reply / forward path: when `body_format != "html"`, skip the second `format_body_for_html`/`sanitize_html` pass — `compose_body` already produced trusted HTML and the regex-based sanitiser can mangle markdown code fences.
+- Two new dependencies: `markdownify>=0.13.1` (HTML→Markdown), `markdown>=3.5` (Markdown→HTML), `extract-msg>=0.50.0` (Outlook .msg compound-file reader).
+- Per-repo git identity is set to `noreply@anthropic.com` to keep
+  contributor email addresses out of public commit history.
+- The `data_dir` (default `data`) is read off the `Settings` object
+  via `getattr` so older configs without the field continue to work.
+
+---
+
+## v3.4 — Test-suite hardening + 3 production bugs
+
+A focused pass to break the "fix one bug, the next refactor regresses
+another" cycle. The shipped tests now pin the structural patterns that
+caused the recurring regressions, and three live bugs that the existing
+suite did not flag are fixed.
+
+### Production bugs fixed
+
+- **`evaluate_rules_on_message` `move_to_folder` action was silently
+  broken.** Three defects in three lines of `_apply_actions`:
+  the lazy `from .folder_tools import resolve_folder_for_account`
+  pointed at the wrong module (`resolve_folder_for_account` lives in
+  `email_tools.py`); the call was missing `await` on a coroutine;
+  the kwarg name was `folder_name=` instead of the actual
+  `folder_identifier=`. All three were masked by the per-action
+  `try/except Exception` that turns failures into a logged
+  `"error"` field, so the rule engine reported `"ok"` overall while
+  no message was actually moved. Resolver is now imported at module
+  top, awaited, and called with the correct positional argument.
+
+- **Audit log silently leaked hyphenated header values.**
+  `redact_sensitive` matched on substring against the `_SENSITIVE_KEY_PATTERNS`
+  list (`password`, `token`, `secret`, `api_key`, ...). Header-style
+  spellings like `X-API-Key`, `Auth-Token`, and `Client-Secret` slipped
+  past because the matcher compared `x-api-key` against `api_key`
+  (no substring hit). The matcher now normalises hyphens to
+  underscores before comparison, so both `api_key` and `X-API-Key`
+  redact identically.
+
+- **`format_body_for_html` misclassified plain text as HTML.**
+  The "looks like HTML" heuristic was `<[^>]+>`, which matched any
+  content containing a `<` — including plain text like `"if a < b"`.
+  Such inputs were routed through `sanitize_html` (which preserves
+  the `<`), so stray `<` ended up in rendered email as raw markup.
+  The heuristic now requires a real opening or closing tag pattern
+  (`</?[a-zA-Z][a-zA-Z0-9]*\b[^<>]*/?>`), so plain text with
+  comparison operators is escaped correctly.
+
+### Structural test additions
+
+- **`tests/test_exchangelib_signatures.py`** — 19 contract tests
+  pinning every `exchangelib` API the codebase calls with kwargs
+  (`Item.delete`, `Item.save`, `Message.send`, `Account.fetch`,
+  `CalendarItem.save`, `OofSettings`, `FileAttachment`, indexed
+  properties imports). The `OofReply`/`disposal_type` outage class
+  now fails locally before code can ship — the tests run against
+  the real `inspect.signature` of the installed `exchangelib`.
+
+- **`tests/test_no_lazy_exchangelib_imports.py`** — AST-based
+  sentinel that fails if any `from exchangelib...` appears inside
+  a function body in `src/`, and a sibling check for lazy
+  intra-`src/tools/` imports. Module-top guarded `try/except`
+  imports remain allowed (they fail loud at import). 14 lazy
+  imports across `oof_tools.py`, `attachment_tools.py`,
+  `calendar_tools.py`, `email_tools.py`, `briefing_tools.py`,
+  `oof_policy_tools.py`, `meeting_prep_tools.py`,
+  `gal_adapter.py`, and `utils.py` were hoisted as part of
+  this change.
+
+- **`tests/test_rule_actions_execute_path.py`** — 7 execute-path
+  tests for `_apply_actions` covering every action type
+  (`move_to_folder`, `flag_importance`, `categorize`, `mark_read`,
+  unknown). The `move_to_folder` test uses an `AsyncMock` resolver
+  + a typed message stub that rejects coroutines and unknown kwargs
+  — the bug fixed above would have failed all three of its
+  assertions.
+
+- **`tests/test_format_body_for_html.py`** — 14 tests pinning the
+  `<` heuristic, the cascading-escape contract, the
+  `sanitize_html` script/style/handler/javascript-uri removal,
+  and the explicit one-shot-vs-idempotent semantics.
+
+- **`tests/test_audit_redaction.py`** — 31 parametrized tests
+  covering every entry in `_SENSITIVE_KEY_PATTERNS`, the substring
+  variants (`client_secret`, `access_token`), header-style
+  spellings (`X-API-Key`), nested dicts, lists of dicts, long-string
+  truncation, and the inventory pin (the explicit list of patterns
+  is asserted whole so subtractions or typos surface immediately).
+
+- **`tests/test_read_attachment.py`** — 9 tests for
+  `ReadAttachmentTool` (CHANGELOG C1) — the tool had no
+  execute-path coverage despite its extractor methods having
+  previously been on the wrong sibling class. Tests pin the dispatch
+  to `_read_pdf` / `_read_docx` / `_read_excel`, the .txt happy
+  path, and every error path (missing attachment, empty content,
+  unsupported extension).
+
+- **`tests/test_add_attachment_passes_content_id.py`** — 2 tests
+  patching `FileAttachment` and inspecting actual constructor
+  kwargs, so a future refactor that records `content_id` in the
+  response dict but drops it from the constructor call (silently
+  breaking inline images) would fail.
+
+### Documentation
+
+- New `docs/COMMON_PITFALLS.md` summarises the seven recurring
+  patterns and their guard tests.
+
+### Operator-visible changes
+
+None. All changes are additive (tests, hoisted imports) or pure
+bug fixes that restore documented behaviour. No tool schema or
+response shape changed.
+
+## Unreleased — AI / semantic_search reachable from Docker bridge networks
+
+**Bug**: every `semantic_search_emails` call against the production NAS
+returned `ToolExecutionError: Embedding provider error: Embedding endpoint
+unreachable at http://&lt;HOST_LAN_IP&gt;:11434/v1/embeddings: ConnectError: All
+connection attempts failed`. The hint pointed at `AI_EMBEDDING_MODEL`, which
+sent the operator on a wrong-trail debug — Ollama was healthy and the model
+was correct.
+
+**Cause**: two issues stacked.
+1. *Networking*: the production container runs on a Docker bridge network
+   (`mcp-network`). From inside the bridge, the host's LAN IP
+   (`&lt;HOST_LAN_IP&gt;`) is NOT routable — bridge containers can only reach the
+   host via the bridge gateway. `AI_BASE_URL=http://&lt;HOST_LAN_IP&gt;:11434/v1`
+   silently failed at TCP-connect time.
+2. *Diagnostic*: `_embedding_error_hint` always returned the same model-name
+   hint regardless of whether the underlying error was an HTTP 404 (wrong
+   model) or a `ConnectError` (unreachable host).
+
+**Fix**:
+- `docker-compose-ghcr.yml` now attaches ews-mcp to a shared external
+  bridge `claude-shared` alongside its private `mcp-network`. Sibling
+  containers (Ollama, Postgres/pgvector, future shared services)
+  attached to the same network resolve each other by container name
+  via Docker DNS — no host-port hop, no hard-coded LAN IPs, and each
+  app keeps its own compose file. A `host.docker.internal` fallback is
+  documented for single-stack deployments that don't want a shared net.
+- Updated `.env.ai.example` with five concrete `AI_BASE_URL` choices
+  ranked by topology (shared external net → bridge fallback →
+  host-network → bare-metal → LAN). Strong warning against using the
+  host's LAN IP from inside a bridge.
+- Refactored the hint dispatcher into `_embedding_error_hint(exc_msg)` —
+  branches on the underlying error and returns a *networking* hint that
+  surfaces both the recommended `claude-shared` path and the
+  `host.docker.internal` fallback when the error is connect-style.
+  Otherwise returns the *model-name* hint. New regression test
+  `tests/test_ai_embedding_hint.py` pins the dispatch.
+
+**Operator action**: one-time `docker network create claude-shared` on
+the host, then attach the Ollama compose to the same external network
+(name the container `ollama` or set a network alias), re-pull ews-mcp
+with the new compose, and set `AI_BASE_URL=http://ollama:11434/v1`.
+
+## Unreleased — `delete_email(permanent=True)` no longer 500s
+
+**Bug**: every `delete_email` / `manage_email` call with `permanent=True` (or
+`hard_delete=True`) returned `500 ToolExecutionError: Failed to delete email:
+TypeError: Item.delete() got an unexpected keyword argument 'disposal_type'`
+on the live NAS. Soft-delete (move-to-trash) was unaffected.
+
+**Cause**: the source called `item.delete(disposal_type=HARD_DELETE)` with a
+fallback to `item.delete(disposal_type="HardDelete")`. Neither kwarg exists
+on `exchangelib.items.Item.delete()` in 5.x — its signature is
+`delete(send_meeting_cancellations, affected_task_occurrences, suppress_read_receipts)`
+and it already invokes `_delete(delete_type=HARD_DELETE)` internally. The
+unit tests passed because `MagicMock().delete(disposal_type=...)` silently
+records any kwarg, so the divergence between the mock and the real signature
+was never caught.
+
+**Fix**: call the bare `item.delete()` — already a HARD_DELETE in 5.x.
+Added a guard test that pins `inspect.signature(Item.delete).parameters` so
+we'd notice if the API ever grows that kwarg back. Surfaced during a live
+NAS smoke test of the reply/forward double-escape fix.
+
+## Unreleased — Reply/forward thread no longer accumulates `&amp;` entities
+
+**Bug**: long email threads would show cascading ampersands between contact
+names — `John Smith &amp;lt;john@x.com&amp;gt;` after one reply,
+`&amp;amp;lt;` after two, and so on. Visible in Outlook / OWA / any HTML mail
+client as literal `&` characters where the angle brackets should be.
+
+**Cause**: `format_forward_header()` was returning recipient strings with
+`&lt;` / `&gt;` already in place. The reply and forward callers
+(`ReplyEmailTool`, `ForwardEmailTool`) then ran the same value through
+`escape_html()` again, turning every `&` into `&amp;`. Each subsequent
+reply quoted the previous body, so the entities compounded on every cycle.
+
+**Fix**: `format_forward_header()` now returns plain text with literal `<`
+and `>`. The single `escape_html()` at the call site is correct and produces
+exactly one level of HTML entities. Regression coverage added in
+`tests/test_reply_forward_escape.py`.
+
+## Unreleased — Test-suite green-up (real bugs surfaced)
+
+Local test suite was 18-failing on a fresh checkout. Triage found 16 test-side
+issues (patch paths, fixture stubs, assertion drift after refactors) plus
+**two real production bugs** that the failing tests had been quietly flagging:
+
+- **`oof_settings(action="set", ...)` with an internal or external reply was
+  unreachable**. The lazy import `from exchangelib import OofSettings, OofReply`
+  raised `ImportError: cannot import name 'OofReply'` because exchangelib 5.x
+  removed the wrapper class. `OofSettings.internal_reply` / `external_reply` are
+  `MessageField(value_cls=str)` — they take plain strings. Switched the source
+  to assign strings directly, dropping the dead `OofReply` wrapping.
+
+- **`add_attachment(is_inline=True, ...)` silently dropped the Content-ID**.
+  The schema didn't accept `content_id`, so callers couldn't reference inline
+  images from HTML body via `cid:<id>`. Added the parameter; passes through to
+  `FileAttachment(..., content_id=...)` and is echoed in the response.
+
+Also: `attachment_tools.py` had redundant lazy `import base64` /
+`from pathlib import Path` shadowing the module-level imports — removed; this
+was breaking unit-test patches as a side effect.
+
+## Unreleased — Tool reliability round (Issues 1–5)
+
+Five defects reported against the live MCP deployment were fixed in this
+round. Each has its own commit / branch so revert risk is surgical:
+
+- **Issue 1** (`find_person` 30s timeout when `source=email_history`).
+  The inbox scan now runs under an `asyncio.wait_for` deadline (default
+  10s, configurable via `EWS_EMAIL_HISTORY_TIMEOUT` — clamped to
+  `[1, 120]`). On timeout / auth / throttling the response carries a
+  structured `error_code ∈ {TIMEOUT, THROTTLED, AUTH_EXPIRED, GAL_UNAVAILABLE}`
+  so the caller can retry or degrade gracefully instead of hitting the
+  30s MCP protocol timeout.
+
+- **Issue 2** (`search_emails` silently truncated results). Paginated
+  fetch now walks the underlying `QuerySet` in explicit 50-item chunks
+  and narrows the `except Exception` at the iteration boundary so the
+  real exception surfaces instead of being swallowed. `total_available`
+  reports the server's `count()`; `next_offset` is set when there are
+  more items behind the page. A new `.only(*db_fields)` projection skips
+  fields the caller didn't ask for.
+
+- **Issue 3** (`search_by_conversation` missed archive / subfolders).
+  Default behaviour walks every mail folder under `account.msg_folder_root`
+  (IPF.Note / IPF.Message classes only — calendar/contacts/tasks are
+  skipped). Callers wanting the old behaviour pass
+  `include_all_folders=false` + `search_scope=["inbox", ...]`. The
+  response advertises `searched_folders` and `skipped_folders` with
+  classified error codes so operators can tell what got missed.
+
+- **Issue 4 — BREAKING CHANGE: legacy search envelope keys dropped.**
+  The `search_emails` / `search_by_conversation` response envelope no
+  longer emits `results`, `total`, `total_results`, or `total_count`.
+  Callers must read `items` + `count` + `total_available` (and
+  `next_offset` when the page is not the last). Migration: every
+  response that used to ship `{"results": [...], "total": N}` now ships
+  `{"items": [...], "count": N}`. `total_available` is populated on a
+  best-effort basis from `QuerySet.count()`; absent when the server
+  refuses to cheap-count.
+
+- **Issue 5 — new tool `get_emails_bulk`.** Batch-fetches up to 50
+  messages (hard cap 100) in a single `GetItem` round-trip via
+  `exchangelib.Account.fetch([Message(id=x), ...])`. Per-id failures
+  are surfaced in `errors[]` with `error_code="NOT_FOUND"` or
+  `"FETCH_ERROR"`; whole-batch failures raise `ToolExecutionError`.
+
+New shared observability helper `src/utils.py::ews_call_log(operation, ...)`
+emits a structured `ews_call` log line on every EWS round-trip with
+stable keys (`operation`, `duration_ms`, `result_count`, `total_available`,
+`page_offset`, `folder`, `outcome`, `error_type`) so dashboards can build
+SLOs on tool latency without parsing free-text log messages.
+
+Regression coverage landed in `tests/test_find_person_timeout.py` (4),
+`tests/test_search_emails_pagination.py` (6), `tests/test_search_by_conversation.py` (7),
+and `tests/test_get_emails_bulk.py` (9). Existing tests that asserted on
+the dropped legacy keys were migrated to `items` / `count` /
+`total_available`.
+
+## Previous — Bug 1 (find_meeting_times) + Bug 2 (embedding error surfacing)
+
+Two operator-reported regressions from the v3.4 security/reliability release
+are fixed here.
+
+### Bug 1 — `find_meeting_times` returned 0 suggestions on a free calendar
+
+`FindMeetingTimesTool.execute` read `busy_info.merged_free_busy`, but
+exchangelib's `FreeBusyView` exposes the merged availability string as
+`busy_info.merged` (the sibling tool `check_availability` was already
+reading `.merged` correctly — fixed in commit `f33632c`). After the C3
+fix that treats "missing merged data" as *busy*, this bug caused every
+slot to be rejected even when the mailbox was entirely free.
+
+**Fix:**
+
+- New helper `_extract_merged(busy_info)` in `src/tools/calendar_tools.py`
+  reads `.merged` first and falls back to the legacy `.merged_free_busy`
+  attribute, so behaviour is correct whatever exchangelib decides to
+  populate.
+- `FindMeetingTimesTool` now uses the helper.
+- A DEBUG-level diagnostic line logs `start_date`, `end_date`, `tzinfo`,
+  `len(availability_data)`, and a sample of merged-string lengths when
+  `LOG_LEVEL=DEBUG`, so this class of bug is trivial to diagnose next
+  time.
+
+### Bug 2 — `semantic_search_emails` silently returned 0 hits on embedding failure
+
+`OpenAIEmbeddingProvider.embed()` called `raise_for_status()` then
+indexed into `response.json()["data"][0]`. Two failure modes slipped past
+with generic error messages:
+
+- A non-2xx response from Ollama/OpenAI's embeddings endpoint (e.g.
+  `model "ollama" not found`) was wrapped in httpx's generic
+  `HTTPStatusError` text without the upstream body.
+- Some OpenAI-compat servers reply **HTTP 200 with an `{"error": ...}`
+  body** — the index access then raised `KeyError`, bubbling up as
+  "Failed to perform semantic search: 'data'".
+
+**Fix (in order of defence-in-depth):**
+
+1. **New `EmbeddingError` exception** (`src/exceptions.py`). Dedicated
+   error type callers can catch to distinguish embedding failures from
+   other tool errors.
+2. **`OpenAIEmbeddingProvider._post_embeddings`** (new): centralises the
+   HTTP call, pulls the upstream error message out of the body (handles
+   `{"error": {"message": ...}}` and `{"error": "string"}`), wraps
+   network failures with a clear message, and rejects 2xx responses with
+   a top-level `error` field or a missing `data` array.
+3. **`OpenAIEmbeddingProvider.health_check()`**: small probe method
+   callers can use at startup (or first invocation) to convert "0 hits
+   at query time" into a visible failure.
+4. **`SemanticSearchEmailsTool.execute`**:
+   - When the folder has no messages, return an explicit
+     `success: true, result_count: 0, message: "No messages found in
+     folder '...'"` — distinguishable from an embedding failure.
+   - When `EmbeddingError` is raised, surface the upstream message plus
+     an actionable hint:
+     `Embedding provider error: <upstream> | Hint: Verify
+     AI_EMBEDDING_MODEL matches an installed model at AI_BASE_URL (e.g.
+     'text-embedding-3-small' for OpenAI, 'nomic-embed-text' for Ollama).`
+5. **Config warning** (`src/config.py`): when
+   `ENABLE_SEMANTIC_SEARCH=true` and `AI_EMBEDDING_MODEL` is set to a
+   likely-provider-name (`ollama`, `openai`, `anthropic`, `cohere`,
+   `voyage`, `local`), log a warning at startup so operators catch the
+   typo before the first search call.
+6. **Size cap**: `embed_batch` refuses more than 256 inputs per call to
+   keep the process responsive; callers can iterate.
+
+### Acceptance (matches the bug reporter's test plan)
+
+Bug 1 — reproduction call against an all-free calendar now returns ≥ 5
+suggestions (up to `max_suggestions`).
+
+Bug 2 — with the wrong model, the repro call now returns:
+
+```json
+{
+  "success": false,
+  "error": "Embedding provider error: Embedding provider returned HTTP 404 for model 'ollama': model \"ollama\" not found, try pulling it first | Hint: Verify AI_EMBEDDING_MODEL matches an installed model at AI_BASE_URL (e.g. 'text-embedding-3-small' for OpenAI, 'nomic-embed-text' for Ollama)."
+}
+```
+
+With a correct model the call returns ranked results as before.
+
+### Tests
+
+`tests/test_bug_fixes.py` — 17 new tests:
+
+- `_extract_merged` helper: picks the current attribute, falls back to
+  legacy, returns None when absent.
+- `find_meeting_times`: all-free, partial-busy, missing-merged,
+  legacy-attribute paths.
+- `OpenAIEmbeddingProvider`: 404 + error body surfaced, 200 +
+  error-body surfaced, missing `data` rejected, mismatched batch size
+  rejected, empty input short-circuits without network, connection
+  errors wrapped, happy-path still returns a vector, provider-name
+  warning on init.
+- `SemanticSearchEmailsTool`: upstream error surfaced to operator with
+  hint, empty folder returns explicit "No messages" message.
+
+All 17 pass; full suite: 164 passing (was 147), 18 pre-existing failures
+unchanged.
+
+### Files changed
+
+```
+src/exceptions.py            (+10)  EmbeddingError
+src/ai/openai_provider.py    (+90, -15)  hardened HTTP + health_check
+src/tools/calendar_tools.py  (+30, -1)   _extract_merged + debug log
+src/tools/ai_tools.py        (+25, -5)   empty folder + embedding error
+src/config.py                (+18)  typo-warning for AI_EMBEDDING_MODEL
+tests/test_bug_fixes.py      (+330, new)
+```
+
+---
+
+## Unreleased — Agent-secretary stack (memory, commitments, approvals, rules, briefings)
+
+Adds a persistent, per-mailbox state layer and 24 new MCP tools that
+turn the server from a stateless Exchange client into an **agentic
+secretary**. See [`docs/AGENT_SECRETARY.md`](docs/AGENT_SECRETARY.md) for
+the full guide.
+
+### New infrastructure
+
+- **`src/memory/`** — SQLite-backed, per-mailbox KV store with
+  namespaces, TTL, size caps (1 MiB/value, 50 MiB/namespace), atomic
+  read-delete (`consume`), and an audit table. Every mailbox gets its
+  own file under `EWS_MEMORY_DIR` (default `data/memory/`) with a
+  SHA-256-prefix filename — raw emails never touch the filesystem.
+- **Typed repositories** — `CommitmentRepo`, `ApprovalRepo`, `RuleRepo`,
+  `VoiceRepo`, `OOFPolicyRepo`. Each wraps the KV in a typed API and
+  validates inputs.
+- **BaseTool.get_memory_store()** — single helper every agent tool uses
+  to reach the store for the authenticated primary mailbox.
+
+### New MCP tools (24)
+
+- **Memory** (4): `memory_set`, `memory_get`, `memory_list`, `memory_delete`
+- **Commitments** (4): `track_commitment`, `list_commitments`,
+  `resolve_commitment`, `extract_commitments` (AI-assisted)
+- **Approval queue** (5): `submit_for_approval`,
+  `list_pending_approvals`, `approve`, `reject`,
+  `execute_approved_action` (atomic, single-use)
+- **Voice profile** (2): `build_voice_profile` (samples Sent folder,
+  AI-generates a style card), `get_voice_profile`
+- **Rule engine** (5): `rule_create`, `rule_list`, `rule_delete`,
+  `rule_simulate`, `evaluate_rules_on_message`. Match keys and action
+  types are strict allow-lists.
+- **OOF policy** (3): `configure_oof_policy`, `get_oof_policy`,
+  `apply_oof_policy` (creates drafts, never sends)
+- **Compound** (2): `generate_briefing` (inbox delta + meetings +
+  commitments + overdue tasks + VIP activity), `prepare_meeting`
+  (attendees + history + notes + attachment previews)
+
+### `send_email` gains `dry_run`
+
+`send_email(dry_run=true)` validates inputs, builds the Message object,
+and returns a preview without calling `message.send()` or touching the
+Drafts folder. Useful for "what would this send" pre-flight checks.
+
+### New config flags
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `ENABLE_AGENT` | `true` | Registers the 24 agent-secretary tools |
+| `EWS_MEMORY_DIR` | `data/memory` | Jail for per-mailbox SQLite files |
+
+### Tool count
+
+- Base tools: 42 → **66** (24 new base tools under `ENABLE_AGENT=true`)
+- Optional AI tools: 4 → 4 (unchanged)
+- Grand total with everything on: **70**
+
+### Security properties
+
+- Per-mailbox file isolation by design (no shared tables between users)
+- SQL placeholder-only queries
+- Path jailing on the DB file directory
+- Strict alphabet for namespaces and keys
+- Value size caps + LRU pruning
+- Atomic `consume` for single-use approval tokens
+- Allow-lists for rule actions, match keys, and approval-queue actions
+- AI prompts enforce PII-redaction instructions for the voice profile
+- Forward rules only ever create drafts
+
+### Test coverage
+
+`tests/test_agent_secretary.py` — 23 new tests covering:
+- Memory roundtrip, isolation, key/namespace validation, size caps,
+  TTL expiry, list filtering, atomic consume, path jailing
+- Commitment lifecycle, overdue filter, validation errors
+- Approval submit/decide, action allow-list, double-consume refusal,
+  TTL validation
+- Rule action and match-key allow-lists, `fnmatch` semantics, AND
+  combination across multiple match keys
+- Voice and OOF repo roundtrips
+- Reserved-namespace refusal from generic memory tools
+
+All 23 pass; 18 pre-existing failures unchanged (147 passing total).
+
+### Files added
+
+```
+src/memory/__init__.py
+src/memory/store.py
+src/memory/models.py
+src/tools/memory_tools.py
+src/tools/commitment_tools.py
+src/tools/approval_tools.py
+src/tools/voice_tools.py
+src/tools/rule_tools.py
+src/tools/oof_policy_tools.py
+src/tools/briefing_tools.py
+src/tools/meeting_prep_tools.py
+tests/test_agent_secretary.py
+docs/AGENT_SECRETARY.md
+```
+
+### Known follow-ups (intentionally deferred)
+
+- Background watcher that fires `evaluate_rules_on_message` on
+  inbound mail via `exchangelib` streaming notifications. Manual
+  evaluation works today; the watcher is a separate infra change.
+- Scheduled/recurring agent tasks (cron-style). Out of scope for this
+  PR; plugs into the same memory layer when added.
+- Memory-backed voice application inside `suggest_replies` /
+  `create_reply_draft` prompts. The profile is stored and fetchable;
+  wiring it into each draft prompt is a narrow follow-up.
+
+---
+
+## Unreleased — Security and reliability hardening
+
+This release closes the 6 HIGH-severity findings from the end-to-end security
+review and the top code-quality bugs found alongside them. **Behaviour
+changes that operators need to know about** are called out under
+"Breaking / operator-visible changes".
+
+### Security fixes (HIGH)
+
+- **S1 — Authenticated HTTP/SSE transport.** When `MCP_API_KEY` is set,
+  every request to `/sse`, `/messages`, `/openapi.json`, and
+  `/api/tools/{tool}` must present `Authorization: Bearer <key>` (or
+  `X-API-Key`). Only `/health` remains public. The OpenAPI schema now
+  advertises `bearerAuth` instead of the unenforced `basicAuth`.
+- **S2 — TLS verification restored by default.** The EWS HTTP adapter
+  no longer globally disables certificate verification. Set
+  `EWS_INSECURE_SKIP_VERIFY=true` to opt back in for internal Exchange
+  servers with private CAs — a `WARNING` log line is emitted when used.
+- **S3 — `download_attachment` path jail.** `save_path` is now treated
+  as a basename hint only; directory components and `..` are stripped
+  and the resolved path is verified to live inside `EWS_DOWNLOAD_DIR`
+  (defaults to `./downloads`). This closes the pre-auth
+  arbitrary-file-write → RCE chain with S1.
+- **S4 — HTML injection in reply/forward drafts fixed.** `reply_email`,
+  `forward_email`, `create_reply_draft`, and `create_forward_draft`
+  now HTML-escape the original message's From/To/Cc/Subject/Sent
+  fields and pass user-supplied bodies through a proper sanitiser
+  (`utils.sanitize_html`, which now actually removes `<script>`,
+  `<style>`, `on*=` handlers, and `javascript:` URIs). Plain-text
+  bodies are escaped and newline→`<br/>` converted.
+- **S5 — Audit log redaction.** `AuditLogger.log_operation` now runs
+  every `details` payload through a new `redact_sensitive()` helper
+  before writing to `audit.log`. Fields matching `password`, `token`,
+  `secret`, `api_key`, `authorization`, `body`, `html_body`,
+  `text_body`, `file_content`, `content_base64`, `mime_content`, or
+  `inline_attachments` are replaced with `[redacted]` / length hints.
+- **S6 — Default bind `127.0.0.1`.** `MCP_HOST` defaults to loopback;
+  the SSE startup now refuses to bind a non-loopback address without
+  `MCP_API_KEY`, and warns when running on loopback with no API key.
+
+### Code-quality fixes (High)
+
+- **C1** `read_attachment` now correctly extracts PDF / DOCX / XLSX.
+  The `_read_pdf`, `_read_docx`, `_read_excel` methods were incorrectly
+  placed on `AttachEmailToDraftTool` (they were unreachable from
+  `ReadAttachmentTool.execute`, which silently fell back to a generic
+  "Failed to read attachment" error for every non-TXT extraction).
+- **C2** `main.py` now returns **JSON** over the MCP transport.
+  Responses were built with `str(result)` (Python repr — single
+  quotes, `True/False/None`, opaque `str(datetime(...))`).
+- **C3** `find_meeting_times` fixes: slots outside the returned
+  `merged_free_busy` range are now treated as **unavailable** (they
+  were falsely reported as free), dead buffer-check code now actually
+  runs, and accepted slots advance by `duration_minutes` so the tool
+  stops emitting N overlapping 15-minute shifts of the same hour.
+- **C4** `EmailService.get_message` and `ThreadService.get_thread` now
+  use `account.trash` instead of the nonexistent `account.deleted`
+  (which previously raised and was swallowed by a bare `except:`,
+  silently skipping Deleted Items).
+- **C5** OAuth2 credential path simplified. `AuthHandler` no longer
+  pre-fetches an MSAL token that was then thrown away; `exchangelib`
+  already handles the OAuth2 token lifecycle internally.
+- **C6** Advanced search responses now stringify `ItemId` via
+  `ews_id_to_str` so `message_id` is a plain string, matching the
+  other search modes.
+
+### Code-quality fixes (Medium)
+
+- **C7** `RateLimiter`, `CircuitBreaker`, and `CacheAdapter` are now
+  thread-safe; a `threading.Lock` guards every mutating critical
+  section so concurrent tool executions don't race on the rate window,
+  failure count, or cache dict.
+- **C8** Inline-attachment `content_id` values are sanitized (spaces
+  → dashes, non-ASCII stripped) and de-duplicated so multiple inlines
+  with the same basename don't collide and so `cid:...` references
+  render correctly in Outlook/OWA.
+- **C9** `parse_datetime_tz_aware` / `parse_date_tz_aware` are now
+  annotated `Optional[...]` to match their actual behaviour; bad
+  inputs log a DEBUG line so silent None-assignment to exchangelib
+  fields stops being invisible.
+- **C10** `CreateReplyDraftTool` / `CreateForwardDraftTool` now use
+  `add_reply_prefix` / `add_forward_prefix` so threads no longer stack
+  "RE: RE: RE: …".
+- **C11** Plain-text bodies in reply/forward/draft tools are HTML-escaped
+  and newlines converted to `<br/>` (handled by the new
+  `utils.format_body_for_html`).
+- **C12** `ConnectionError` renamed to `EWSConnectionError` (alias
+  kept for one release). The old name shadowed the Python builtin of
+  the same name and broke `isinstance(e, ConnectionError)` matching
+  for real OS-level socket errors.
+- **C13** `GetCalendar` end-date heuristic no longer over-collects the
+  day after when the caller explicitly asks for events ending at
+  midnight; it now checks whether the input was date-only (no `T`).
+- **C14** `EmbeddingService._save_cache` writes atomically
+  (`tempfile` + `os.replace`) so a crash mid-write cannot corrupt
+  `embeddings.json`.
+- **C15** `EmbeddingService.embed_batch` no longer has an O(N²)
+  `indices_to_embed.index(i)` lookup; replaced with positional
+  iteration.
+- **C16** `openapi_adapter.handle_rest_request` now returns a proper
+  HTTP status (400 / 401 / 429 / 503 / 500) when a tool fails, matching
+  the advertised OpenAPI responses.
+- **C17** Tool-count comments corrected in `main.py` (42 base + 4 AI = 46).
+- **C19** AI tools (`semantic_search_emails`, `classify_email`,
+  `summarize_email`, `suggest_replies`) now accept `target_mailbox`
+  for impersonation — they used to be the only four tools that
+  ignored it.
+
+### Code-quality fixes (Low)
+
+- **C21** Remaining bare `except:` clauses in `attachment_service.py`
+  replaced with logged `except Exception:` blocks.
+- **C22** `run_server.py` no longer hardcodes `C:\Tools\ews-mcp`. It
+  uses `os.path.dirname(os.path.abspath(__file__))` so the MSIX
+  wrapper works from any install location on any OS.
+- **C25** Config now logs when `AI_MODEL` / `AI_EMBEDDING_MODEL`
+  defaults are applied (previously silent) and warns when semantic
+  search is enabled against a local provider without
+  `AI_EMBEDDING_MODEL` set.
+
+### New settings
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `MCP_API_KEY` | — | Bearer token required on every non-`/health` request on the SSE transport |
+| `MCP_HOST` | `127.0.0.1` (was `0.0.0.0`) | Bind address for SSE |
+| `EWS_INSECURE_SKIP_VERIFY` | `false` | Opt-in for internal Exchange with private CAs |
+| `EWS_DOWNLOAD_DIR` | `downloads` | Jail directory for `download_attachment` writes |
+
+### Breaking / operator-visible changes
+
+- **SSE transport binds `127.0.0.1` by default.** Docker-compose files
+  that expect the server on `0.0.0.0` must now set `MCP_HOST=0.0.0.0`
+  **and** `MCP_API_KEY=<secret>` — startup refuses the combination
+  without a key.
+- **TLS is verified by default.** Setups that depended on the old
+  behaviour must set `EWS_INSECURE_SKIP_VERIFY=true` or install the
+  internal CA bundle into the container's trust store.
+- **`download_attachment` save path is jailed.** Callers can no
+  longer pick an arbitrary filesystem location; only the basename of
+  `save_path` is honoured and the file is written under
+  `EWS_DOWNLOAD_DIR`. The response `file_path` shows the actual
+  location.
+- **MCP tool responses are now JSON** rather than Python repr.
+  Clients that relied on parsing `True`/`False`/single-quoted dicts
+  need to switch to `json.loads`.
+- **`ConnectionError` → `EWSConnectionError`.** The old name is
+  aliased for one release but should be replaced in any downstream
+  `except` / `isinstance` checks.
+
+### Files changed (18)
+
+`src/main.py`, `src/config.py`, `src/auth.py`, `src/ews_client.py`,
+`src/exceptions.py`, `src/utils.py`, `src/openapi_adapter.py`,
+`src/middleware/logging.py`, `src/middleware/rate_limiter.py`,
+`src/middleware/circuit_breaker.py`, `src/middleware/error_handler.py`,
+`src/adapters/cache_adapter.py`, `src/tools/attachment_tools.py`,
+`src/tools/email_tools.py`, `src/tools/email_tools_draft.py`,
+`src/tools/calendar_tools.py`, `src/tools/ai_tools.py`,
+`src/services/email_service.py`, `src/services/thread_service.py`,
+`src/services/attachment_service.py`, `src/ai/embedding_service.py`,
+`run_server.py`, `tests/test_attachment_tools.py`.
+
+---
+
+## Prior to this release (also unreleased) — Drafts, folder discovery, availability fixes
+
+### New Tools (+4)
+
+Base tool count: **42** (38 → 42 with the additions below). Total with AI: **46**.
+
+- `create_draft` — create an email draft in the Drafts folder without sending
+- `create_reply_draft` — build a reply draft (quoted original, signature placeholder) for AI preview-before-send
+- `create_forward_draft` — build a forward draft for AI preview-before-send
+- `find_folder` — locate a folder by name or ID anywhere in the mailbox hierarchy
+
+### New Features
+
+- **HTML reply/forward drafts** (`src/tools/email_tools_draft.py`): preserve the original conversation, inline images, CDATA blocks, and Outlook-style quoted headers when composing a reply or forward.
+- **Folder-ID support** on `move_email`, `copy_email`, and `manage_folder`: pass `destination_folder_id` / `parent_folder_id` to resolve by stable Exchange ID instead of display name or path.
+- **Email MIME export** (`get_email_mime`): return the raw RFC-822 MIME of a message.
+- **Attach email to draft** (`attach_email_to_draft`): attach another message as an `.eml` file to a draft.
+- **Windows MSIX wrapper**: new entrypoint script corrects the Claude Desktop MSIX working-directory bug on Windows.
+
+### Bug Fixes
+
+- **Availability parsing** (`check_availability`): correctly parse exchangelib `merged_free_busy` responses.
+- **Availability coverage**: include the current authenticated mailbox in availability checks by default.
+- **Scheduling responses**: clarify free/busy output so the AI can act on the result without a second round-trip.
+- **Reply / forward drafts**: fix threading metadata, signature placement, and duplicate `RE:` / `FW:` prefixes; preserve styles and CDATA in quoted HTML bodies.
+- **Draft attachments**: attachment flow on drafts was failing in certain edge cases; fixed as part of the backlog-folder / availability / draft-attachment work.
+
+### Documentation
+
+- README fully refreshed: accurate tool counts (42 base + 4 AI = 46), full tool tables per category, complete environment-variable reference, corrected architecture diagram, new "Known limitations" section.
+- New draft-workflow and folder-discovery examples.
+
+### Known Limitations (unchanged from v3.4.0)
+
+- The four AI tools (`semantic_search_emails`, `classify_email`, `summarize_email`, `suggest_replies`) do not honor `target_mailbox`; they always act on the primary authenticated mailbox.
+- `read_attachment` extracts PDF / DOCX / XLSX only.
+- The SSE/HTTP transport is unauthenticated and binds `0.0.0.0` by default — put it behind an auth-enforcing reverse proxy for any non-local deployment.
+
+---
+
+## v3.4.0 — Phase 3+4: Reliability & Code Quality (2026-03-15)
+
+### New Features
+
+#### Circuit Breaker (`src/middleware/circuit_breaker.py`)
+- Trips after 3 consecutive EWS connectivity failures
+- Rejects requests immediately for 60s instead of waiting for timeout
+- Allows one probe request after timeout to test recovery
+- Only trips on connectivity/timeout errors, not user errors (validation, not-found)
+- Saves ~30s per request when Exchange is down (no more 3x10s timeout retries)
+
+### Improvements
+
+#### Simplified Error Messages
+- `validate_input()` now produces `"to: Input should be a valid list"` instead of multi-line Pydantic internals
+- `format_error_response()` returns `{"success": false, "error": "..."}` (removed redundant `error_type` field)
+- Error messages truncated to 200 chars max — prevents Claude from processing paragraph-length Exchange error dumps
+- `find_message_for_account()` returns `"Message not found: {id}"` instead of a 3-line suggestion paragraph
+
+#### Proper async/await (`asyncio.to_thread`)
+- All `resolve_names()` calls in GALAdapter wrapped in `asyncio.to_thread()` — no longer blocks event loop
+- PersonService `_search_contacts()` and `_search_email_history()` run blocking iteration in thread pool
+- Inbox + Sent scans in `_search_email_history` and `get_communication_history` now run concurrently via `asyncio.gather()`
+
+### Code Quality
+
+#### Removed Dead Code
+- Removed `handle_ews_errors` decorator from `utils.py` (~70 lines) — was defined but never used by any tool
+- All tools use `BaseTool.safe_execute()` for error handling instead
+
+#### Deduplicated JSON Serialization
+- `EWSJSONEncoder.default()` now delegates to `make_json_serializable()` instead of duplicating the same logic
+- Single source of truth for datetime/EWS-object serialization
+
+### Token Budget Impact
+| Component | v3.3 | v3.4 | Savings |
+|---|---|---|---|
+| Error responses | ~150 tokens | ~50 tokens | -67% |
+| Circuit breaker (Exchange down) | ~5,000 tokens/min wasted | ~200 tokens/min | -96% |
+| **Simple operation total** | ~6,700 | ~6,200 | **-7%** |
+
+### Files Changed
+| File | Change |
+|---|---|
+| `src/middleware/circuit_breaker.py` | NEW (87 lines) |
+| `src/middleware/__init__.py` | Added CircuitBreaker export |
+| `src/tools/base.py` | Circuit breaker integration + simplified validation errors |
+| `src/utils.py` | Removed handle_ews_errors, deduplicated JSON encoder, simplified error responses |
+| `src/adapters/gal_adapter.py` | asyncio.to_thread for all resolve_names calls |
+| `src/services/person_service.py` | asyncio.to_thread + asyncio.gather for blocking EWS operations |
+
+---
+
+## v3.3.0 — Phase 2: Tool Consolidation (2026-03-15)
+
+### Breaking Changes
+**10 tools removed** from the MCP surface. AI assistants will automatically adapt via `list_tools`. External automation calling these tools by name will need updating.
+
+**Removed tools and their replacements:**
+
+| Removed Tool | Replacement | How to Migrate |
+|---|---|---|
+| `advanced_search` | `search_emails` with `mode: "advanced"` | Add `mode: "advanced"` parameter |
+| `full_text_search` | `search_emails` with `mode: "full_text"` | Add `mode: "full_text"`, rename `query` param |
+| `search_contacts` | `find_person` with `source: "contacts"` | Use `find_person(query="...", source="contacts")` |
+| `get_contacts` | `find_person` with `source: "contacts"` | Use `find_person(source="contacts")` (no query = list all) |
+| `resolve_names` | `find_person` with `source: "gal"` | Use `find_person(query="...", source="gal")` |
+| `create_folder` | `manage_folder` with `action: "create"` | Add `action: "create"` parameter |
+| `delete_folder` | `manage_folder` with `action: "delete"` | Add `action: "delete"` parameter |
+| `rename_folder` | `manage_folder` with `action: "rename"` | Add `action: "rename"` parameter |
+| `move_folder` | `manage_folder` with `action: "move"` | Add `action: "move"`, use `destination` param |
+| `get_oof_settings` | `oof_settings` with `action: "get"` | Use `oof_settings(action="get")` |
+| `set_oof_settings` | `oof_settings` with `action: "set"` | Use `oof_settings(action="set", state="...")` |
+| `get_communication_history` | `analyze_contacts` with `analysis_type: "communication_history"` | Add `analysis_type: "communication_history"` |
+| `analyze_network` | `analyze_contacts` with `analysis_type: "overview"` etc. | Use `analyze_contacts(analysis_type="...")` |
+
+### Tool Count (at v3.3 release)
+- **Before:** 46 tools (42 base + 4 AI)
+- **After v3.3:** 36 tools (32 base + 4 AI)
+- **Reduction:** -10 tools
+
+> **Note:** The base tool count has since grown back to 42 with the addition of `create_draft`, `create_reply_draft`, `create_forward_draft`, `find_folder`, `get_email_mime`, and `attach_email_to_draft` in later releases (see the Unreleased section at the top of this file).
+
+### New Merged Tools
+
+#### `search_emails` (unified search)
+- `mode: "quick"` (default) — filter by subject, sender, date, read status, attachments
+- `mode: "advanced"` — multi-folder search with sort, categories, importance, keywords
+- `mode: "full_text"` — full-text search across subject, body, attachment names
+
+#### `find_person` (unified contact lookup)
+- `source: "all"` (default) — search GAL + contacts + email history
+- `source: "gal"` — Active Directory only
+- `source: "contacts"` — personal contacts only (no query = list all)
+- `source: "email_history"` — email history only
+- `source: "domain"` — domain-based search
+
+#### `manage_folder` (unified folder management)
+- `action: "create"` — create new folder
+- `action: "delete"` — delete folder (soft or permanent)
+- `action: "rename"` — rename folder
+- `action: "move"` — move folder to new parent
+
+#### `oof_settings` (unified OOF)
+- `action: "get"` — retrieve current OOF settings
+- `action: "set"` — configure OOF settings
+
+#### `analyze_contacts` (unified contact analysis)
+- `analysis_type: "communication_history"` — history with specific person (uses server-side sender filter)
+- `analysis_type: "overview"` — comprehensive network overview
+- `analysis_type: "top_contacts"` — most-emailed contacts
+- `analysis_type: "by_domain"` — contacts grouped by domain
+- `analysis_type: "dormant"` — inactive relationships
+- `analysis_type: "vip"` — high-volume recent contacts
+
+### Performance Improvements
+- **Token savings:** ~2,200 tokens per `list_tools` call (10 fewer schemas × ~220 tokens each)
+- **Wrong-tool retries eliminated:** Claude no longer picks wrong search/contact tool
+- **Server-side filtering:** `analyze_contacts(analysis_type="communication_history")` uses `sender__email_address` server-side filter instead of scanning 2,000 items client-side
+- **SearchByConversationTool:** `folder_map` moved outside loop (was recreated 3× per call)
+
+### Bug Fixes
+- Fixed version string drift: `docker-compose-ghcr.yml`, `docker-entrypoint.sh` now show v3.3
+- Fixed `SearchByConversationTool` creating `folder_map` inside loop
+
+### Token Budget Impact
+| Component | v3.2 | v3.3 | Savings |
+|---|---|---|---|
+| Tool schemas (list_tools) | ~10,000 | ~4,500 | -55% |
+| Tool selection retries | ~800 | ~200 | -75% |
+| **Simple operation total** | ~18,000 | ~6,700 | **-63%** |
+
+---
+
+## v3.2.0 — Phase 1: Token Optimization & Bug Fixes (2026-03-14)
+
+### Bug Fixes
+- Fixed autodiscovery ignoring `EWS_SERVER_URL` when `EWS_AUTODISCOVER=true`
+- Fixed Docker container unable to reach corporate Exchange (switched to `network_mode: host`)
+- Fixed single-day calendar queries returning wrong/missing events (zero-duration window)
+- Fixed `format_datetime` not defined in `search_tools.py` (missing import)
+- Fixed auth retry loop: `retry_if_not_exception_type(AuthenticationError)` skips retries on auth failures
+- Fixed recursive folder search: subfolders + `root.walk()` fallback
+
+### Optimizations
+- Trimmed all 46 tool descriptions to 1 line (under 15 words)
+- Removed dead `_search_email_history` from FindPersonTool (~140 lines)
+- Replaced GAL fuzzy search 8-prefix loop with single query (1 API call instead of 8)
+- Removed redundant recipient pre-validation from SendEmailTool (~40 lines, N API calls)
+- Deduplicated `INLINE_ATTACHMENTS_SCHEMA` to single definition in `utils.py`
+- Added server-side `sender__email_address` filter in PersonService
+
+### New Features
+- Base64 `inline_attachments` support on 5 tools (send_email, reply_email, forward_email, create_appointment, update_appointment)
+- Person-centric architecture with multi-strategy GAL search (4 fallback strategies)

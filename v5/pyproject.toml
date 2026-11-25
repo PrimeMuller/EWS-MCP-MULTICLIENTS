@@ -1,0 +1,51 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ews-mcp"
+version = "4.5.0a4"
+description = "EWS MCP server — a lean, safety-gated, cache-first tool surface for a mailbox assistant (see DESIGN.md)"
+requires-python = ">=3.11"
+dependencies = [
+    "defusedxml>=0.7",  # imported directly by the document reader
+    "exchangelib==5.6.0",
+    "jsonschema>=4.21",
+    "mcp>=1.30,<2",
+    "pydantic>=2.8",
+    "pydantic-settings>=2.5",
+    "tzdata",  # zoneinfo source of truth: slim images/Windows ship no OS tzdb
+    "uvicorn>=0.30",
+]
+
+[project.optional-dependencies]
+extract = [
+    "pypdf>=6.21,<7",
+]
+dev = [
+    "html5lib>=1.1",
+    "pypdf>=6.21,<7",
+    "pytest>=8",
+    "pytest-asyncio>=0.23",
+    "ruff>=0.4",
+]
+
+[project.scripts]
+ewsmcp = "ewsmcp.main:main"
+
+[tool.setuptools.packages.find]
+include = ["ewsmcp*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "strict"
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+# Explicit rule set: the gate must not change meaning when a new ruff release
+# widens its defaults (that turned CI red on an untouched tree). Widen it here,
+# deliberately, in the same change that fixes what the new rules report.
+select = ["E4", "E7", "E9", "F"]
