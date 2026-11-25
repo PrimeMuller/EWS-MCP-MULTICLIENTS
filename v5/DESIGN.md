@@ -3,7 +3,8 @@
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) explains how the server is built; this file holds the rules.
 
 The architecture the code enforces. Module docstrings cite the sections
-below (§Tools, §Safety, §Ids, §DTOs, §Errors, §Transports, §Audit, §Cache).
+below (§Tools, §Safety, §Mailboxes, §Throttling, §Untrusted content, §Ids,
+§DTOs, §Errors, §Transports, §Audit, §Cache).
 
 ## The law
 
@@ -38,7 +39,17 @@ below (§Tools, §Safety, §Ids, §DTOs, §Errors, §Transports, §Audit, §Cach
    counted and a burst can reach the cap at once. All exchangelib imports
    are module-top; every kwarg-bearing call and overridden hook has a
    signature pin.
-6. **No footprints.** No personal names, real addresses, employer
+6. **One mailbox per call, never a mailbox argument.** In bearer mode the
+   mailbox comes from the caller's own token, and everything stored for a
+   mailbox — aliases, mirror, audit chain, budgets — lives in its own
+   namespace and is touched only after Exchange accepted that token
+   (§Mailboxes). The server authenticates no one and holds no Exchange
+   credentials of its own in that mode.
+7. **Exchange is protected before it is contacted.** Every limit — per
+   mailbox, per process, Exchange's own stated back-off — refuses locally
+   with `retry_after_s`; nothing blocks a worker for long and nothing polls
+   (§Throttling).
+8. **No footprints.** No personal names, real addresses, employer
    identifiers, personal skill names, mailbox content, or tokens in any
    tracked file, comment, commit message, or doc. Fixtures use
    example.com and neutral wording.
@@ -74,7 +85,9 @@ Dispatch order (argument-known policy precedes connectivity, while
 content-dependent policy such as `cancel_event` runs on the preview fetch
 after connectivity; nothing irreversible without two model decisions):
 
-    kill-switch (from args) → tier → circuit (requires_ews=True) →
+    kill-switch (from args) → tier → global upstream circuit (bearer) →
+    mailbox binding (bearer: token proven, call bound to its session) →
+    mailbox circuit (requires_ews=True) → stated back-off → call budget →
     cold / auth gate (requires_ews=True) → recipient guard (args) →
     two-phase confirm [preview → kill-switch & recipient guard (content) →
     verify token → refuse used token → reserve send slot → consume token
@@ -194,10 +207,14 @@ after connectivity; nothing irreversible without two model decisions):
   longer) or with no visible non-blank text after sanitising fail with
   `validation` before touching Exchange; any stripped elements,
   attributes, or link parts are reported in `sanitised`.
-- **Send rate cap** `EWS_MAX_SENDS_PER_HOUR`: in-memory, per-process cap
-  counting every confirmed call that sends (class `send` and `notifies`,
-  plus unconfirmed replays); a call refused with `rate_capped` keeps its
-  token.
+- **Send rate caps** `EWS_MAX_SENDS_PER_HOUR` (per mailbox) and
+  `EWS_GLOBAL_MAX_SENDS_PER_HOUR` (all mailboxes, off by default): rolling
+  1-hour windows in the state backend (in-process, or Redis shared by every
+  process), counting every confirmed call that sends (class `send` and
+  `notifies`, plus unconfirmed replays), reserved all-or-nothing before the
+  token is consumed; a call refused with `rate_capped` keeps its token.
+  Spent confirm tokens live in the same backend, so a token spent on one
+  process cannot be replayed on another.
 - **Inbox rules safety**: `save_rule` builds `Actions` strictly from an
   allow-list of mailbox-internal actions (`move_to_folder`,
   `copy_to_folder`, `assign_categories`, `mark_as_read`, `mark_importance`,
@@ -219,13 +236,77 @@ after connectivity; nothing irreversible without two model decisions):
   `create_event`, `update_event`, and `cancel_event` keep a check of their
   own as a second line.
 
+## §Mailboxes — many users, one process (bearer mode)
+
+`EWS_AUTH_MODE=bearer` (HTTP only; see docs/SCALING.md):
+
+- **Identity** (`identity.py`): every request carries the caller's EWS
+  OAuth2 access token. The mailbox address comes from its claims
+  (`EWS_TOKEN_MAILBOX_CLAIMS`), optionally keyed by a stable id claim
+  (`EWS_TOKEN_IDENTITY_CLAIM`, e.g. `sid`); `exp`/`nbf` are checked
+  locally; the signature is left to Exchange. No token → HTTP 401.
+- **Sessions** (`sessions.py`): one per user, created on demand, closed
+  after `EWS_MAILBOX_IDLE_SECONDS` idle and LRU past `EWS_MAX_MAILBOXES`.
+  A session owns one gateway per token (one Account/Protocol each; tokens
+  never share a connection), its request slots, its circuit, and its stored
+  parts (alias namespace, audit chain, optional mirror, attachment-text
+  cache). Parts are opened only after the **token proof** — one `GetFolder`
+  on the mailbox's root, naming the mailbox — so an unproven token touches
+  nothing stored. Rejected tokens are remembered until they expire.
+- **Binding** (`tools/base.py`): after kill-switch and tier, `dispatch`
+  binds the call; `Context.bind` yields a per-call context whose gateway,
+  aliases, cache, audit, circuit and `mailbox` belong to the caller. Send
+  receipts, the attachment-text cache and the rules lock are per mailbox.
+- **Shared state** (`state.py`): spent tokens, send windows, call budgets,
+  back-off markers, idempotency receipts and aliases (`ids.RedisAliaser`) in
+  Redis when `EWS_STATE_BACKEND=redis`. Fail closed for tokens and sends.
+- **Gateways** (`gateway/client.py`) share one worker pool and evict only
+  their own `CachingProtocol` entry (never `clear_cache()`, which would cut
+  every other user's sessions; the cache never evicts by itself).
+- Refused in bearer mode: stdio, and the single-mailbox semantic index.
+
+## §Throttling — protect Exchange first
+
+All in `throttle.py`, `sessions.py` and `gateway/client.py`; refusals are
+`LocalRefusal` (Exchange not contacted; never counted as upstream failure):
+
+- per mailbox: `EWS_MAILBOX_MAX_CONCURRENCY` requests in flight (2),
+  `EWS_MAILBOX_CALLS_PER_MINUTE` calls (60 in bearer mode → `rate_capped`);
+- per process: `EWS_MAX_CONCURRENCY` workers (32 in bearer mode) behind a
+  `WorkerGate`; a call that cannot get one in `EWS_QUEUE_TIMEOUT_SECONDS`
+  is shed with `throttled`;
+- Exchange's stated back-off (`ErrorServerBusy.back_off`,
+  `RateLimitError.wait`) holds that mailbox locally until it ends; workers
+  sleep at most `EWS_RETRY_MAX_WAIT_SECONDS` (5);
+- `EWS_GLOBAL_CIRCUIT_THRESHOLD` consecutive "unreachable" outcomes across
+  mailboxes pause every call for `CIRCUIT_OPEN_SECONDS`;
+- multi-folder search fans out to at most `EWS_FANOUT_MAX_FOLDERS` (50).
+
+## §Untrusted content — mail can carry instructions
+
+- Text hidden from the human reader (inline display:none, visibility,
+  opacity:0, zero/1px fonts, mso-hide, zero-size overflow boxes, the
+  `hidden` attribute) is dropped from bodies, meeting descriptions and
+  HTML/.eml attachments (`bodyclean.visible_text`, `drop_hidden=True`),
+  reported as `hidden_text_removed`. The default conversion is unchanged.
+- `content.py` wraps sender-written text in
+  `<untrusted-content id="<nonce>" source="…">` markers (per-field random
+  nonce; marker-like text inside is defused); on by default in bearer mode
+  (`EWS_MARK_UNTRUSTED_CONTENT`). MCP `initialize` instructions explain it.
+- Not covered: `<style>`/class-based hiding, same-colour text, card
+  snippets, `include_html=true`. The harm-stopping layers stay §Safety
+  plus a human approving sends in the client.
+
 ## §Ids — aliases only
 
 The model never sees a raw EWS id: outputs carry short aliases (`m12`,
 `e3`, `d1`, `a1`, `t4`, `p2`, `k1`, `f7`, `r1`), inputs accept aliases or
 raw ids.
 The SQLite-backed aliaser survives restarts, rebinds on moves, and keeps
-`internet_message_id` as a secondary key. Stale alias → clean re-search
+`internet_message_id` as a secondary key. Every mailbox has its own alias
+namespace (a separate store under `DATA_DIR/mailboxes/<key>/memory`, or
+`<prefix>:alias:<key>:` in Redis), so a small, guessable alias minted for
+one user never resolves to another user's item. Stale alias → clean re-search
 hint, never an upstream error. Page-sized mints batch into one
 transaction and run off the event loop.
 
@@ -343,6 +424,16 @@ without re-downloading or re-extracting and without writing mail to disk.
   retry acquisition every 30 s to take over when the leader exits. If the
   lock file cannot be opened or locked, `ewsmcp` logs once and runs sync
   as before (never-exit rule).
+- **Bearer mode** (`window.py`): no polling. A user's call starts at most
+  one background refresh of their mirror when the last is older than
+  `EWS_CACHE_REFRESH_SECONDS` (60), never waits for it, and skips it past
+  `EWS_CACHE_MAX_CONCURRENT_REFRESHES` per process. A refresh lists the last
+  `EWS_CACHE_WINDOW_DAYS` (14) of each folder (id/changekey/date, newest
+  first, capped), fetches only new or changed items, and refreshes the
+  calendar window — cost follows the window, not the mailbox (a first
+  SyncFolderItems would walk the whole folder). Rows keep a
+  `EWS_CACHE_BODY_CHARS` (300) snippet, so full reads and free-text search
+  go live; the mirror is deleted with the idle session. Off by default.
 - Provenance contract: every read is stamped `source: cache|live`
   (+ `as_of` for cache); `fresh:true` forces live. `EWS_CACHE_ENABLED=
   false` = pure EWS reads, fully functional.
@@ -365,6 +456,10 @@ cap request bodies at `max_body_bytes(settings)` —
 `(EWS_MAX_ATTACHMENT_MB * 1024 * 1024) * 4 // 3 + 1_048_576` bytes
 (base64 expansion of the attachment ceiling plus 1 MiB for JSON
 arguments).
+**Bearer mode**: non-public routes need `Authorization: Bearer <token>`
+(HTTP 401 + RFC 6750 challenge otherwise; `MCP_API_KEY` moves to
+`X-API-Key`). The parsed principal rides on the ASGI scope, because
+stateless Streamable HTTP runs tool calls in a task started at boot.
 **Never-exit boot**: tools register and transports bind before any
 Exchange contact; a background warmup loop owns connection recovery
 (exponential backoff + jitter and protocol-cache eviction every 3
@@ -381,7 +476,9 @@ across restarts (`audit/chain.state`); `scripts/verify_audit_chain.py`
 re-derives every link and detects accidental damage and edits that leave
 `chain.state` alone. The chain has no key, so someone who can write
 `DATA_DIR` can recompute it; several processes sharing one `DATA_DIR` break
-it by themselves; audit writes are best effort.
+it by themselves; audit writes are best effort. In bearer mode each mailbox
+has its own chain under `DATA_DIR/mailboxes/<key>/audit` whose records name
+the acting mailbox; `verify_audit_chain.py --all DATA_DIR` checks them all.
 
 ## Structural guards (scar tissue, encoded)
 

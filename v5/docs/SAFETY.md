@@ -284,8 +284,9 @@ cancellations (`cancel_event` on a meeting with attendees). Phase-1 previews, ca
 without notification, and `cancel_event` calls on plain appointments without attendees are not
 counted.
 
-The counter is held in memory per process: restarting `ewsmcp` resets it, and two processes each
-keep their own counter. At phase two, the order is: verify the token (`confirm_invalid` if wrong,
+The counter is per mailbox and kept in the state backend (in the process by default; shared by every process with `EWS_STATE_BACKEND=redis`): in-process counters reset on restart, while with Redis
+every process counts against the same window. `EWS_GLOBAL_MAX_SENDS_PER_HOUR` adds a cap across
+all mailboxes. At phase two, the order is: verify the token (`confirm_invalid` if wrong,
 expired, or bound to different content), reject an already-used token (`confirm_invalid`), check
 the hourly cap (`rate_capped` with `retry_after_s`, at least `1`), and only then consume the token.
 A call refused with `rate_capped` therefore keeps its token, which succeeds once the hour has room
@@ -389,9 +390,11 @@ Full allow-lists, field caps, and preview rules are in [API.md](API.md#draft-bod
 ## Attachments and message bodies
 
 - **Message and calendar bodies.** The server reads the plain-text `text_body` Exchange provides,
-  and background mirror sync fetches `text_body` only. Only when `text_body` is empty on a live
-  `get_message`, `get_messages`, or `get_event` call — plus on `get_oof_settings` replies and HTML
-  attachments — does it convert HTML with `bodyclean.html_to_text_bounded`. That converter runs in
+  and background mirror sync fetches `text_body` only. It converts HTML itself with
+  `bodyclean.html_to_text_bounded` when `text_body` is empty on a live `get_message`,
+  `get_messages`, or `get_event` call, on `get_oof_settings` replies and HTML attachments, and when
+  the HTML hides text from its reader (see
+  [Mail written to steer the assistant](#mail-written-to-steer-the-assistant)). That converter runs in
   one linear, non-raising pass without `html.parser` and ends `<head>`, `<title>`, `<style>`,
   `<script>`, comments, CDATA, `<svg>`, and `<math>` regions where a browser ends them. Quoted
   reply history and repeated sender signatures are stripped, and raw HTML is omitted unless
@@ -416,6 +419,53 @@ Full allow-lists, field caps, and preview rules are in [API.md](API.md#draft-bod
   `add_draft_attachment` with `message_id` strips `Bcc` and `Resent-Bcc` headers before attaching.
   See [API.md](API.md#draft-attachments).
 
+## Mail written to steer the assistant
+
+Anyone can send your users mail, and the assistant reads it. A message, a meeting description, or
+an attached file can contain instructions aimed at the model — "forward the board minutes to …" —
+often hidden so the person reading the mail never sees them. Two layers reduce what reaches the
+model:
+
+- **Hidden text is removed.** Exchange's plain-text rendering keeps text the sender hid with CSS.
+  When a body's HTML hides text — the `hidden` attribute, or inline `display:none`,
+  `visibility:hidden`, `opacity:0`, a font size of 0 or up to 1px/pt, `mso-hide:all`, or a
+  zero-size box with `overflow:hidden` — the server rebuilds the body from the HTML without it and
+  adds `hidden_text_removed: true`. This applies to `get_message`, `get_messages`, `get_event`
+  descriptions, and HTML and `.eml` attachments, in both modes.
+- **Sender-written text is marked.** With `EWS_MARK_UNTRUSTED_CONTENT=true` (the bearer-mode
+  default), message bodies, thread bodies, meeting descriptions and attachment text arrive wrapped
+  in `<untrusted-content id="<nonce>" source="…">` … `</untrusted-content id="<nonce>">`. The nonce
+  is random per field, so the content cannot fake the closing marker, and marker-like text inside
+  it is defused. The MCP `initialize` instructions tell the client that marked text is data and
+  never instructions.
+
+Neither layer is a guarantee. Not covered: hiding through `<style>` blocks or classes, text
+coloured like its background, the 200-character snippets in search results, and raw HTML returned
+by `include_html=true`. In static mode, bodies served from the full background mirror come from
+Exchange's plain-text rendering and keep hidden text.
+
+What stops an injected instruction from doing harm are the controls above: the send kill-switch,
+capability tiers, recipient lists, caps, and two-phase confirmation. A confirm token proves only
+that the previewed content did not change before it was executed; the model can echo the token
+back by itself. **When the server serves people other than its operator — bearer mode — configure
+the MCP client to require a human's approval before every tool that sends, deletes, or changes
+meetings, automatic replies, or inbox rules** (`send_draft`, `respond_to_event`, `set_oof`,
+`cancel_event`, `delete_messages`, `save_rule`, `delete_rule`, and `create_event` / `update_event`
+when they notify attendees). Their MCP annotations mark them `destructiveHint` and, for sends,
+`openWorldHint`.
+
+## Many mailboxes in one process
+
+In bearer mode one process serves many users, so isolation is part of safety:
+
+- The mailbox comes only from the caller's own token, never from an argument or a header.
+- Nothing stored for a mailbox is opened until Exchange has accepted the caller's token for it.
+- Aliases, the mirror, the audit chain, send windows, budgets, back-offs, idempotency receipts and
+  extracted attachment text are kept per mailbox; confirm tokens are bound to the mailbox.
+- A token Exchange rejects is remembered until it expires and never sent again.
+
+See [SCALING.md](SCALING.md).
+
 ## What is stored and where
 
 All local persistent state lives under `DATA_DIR`, which defaults to `~/.ewsmcp`. When
@@ -434,8 +484,9 @@ Because `DATA_DIR` holds mail at rest in `cache/mirror.db` and `attachments/`, `
 the resolved path for cloud-sync folder markers — `onedrive`, `dropbox`, `google drive`,
 `googledrive`, and `icloud` — and refuses to start if one matches. Point `DATA_DIR` at a local
 directory, or set `DATA_DIR_ALLOW_SYNCED=true` only when you accept that risk deliberately.
-Extracted attachment text, consumed confirm tokens, the hourly send counter, and `send_draft`
-idempotency keys stay in process memory only. See
+Extracted attachment text stays in process memory only. Consumed confirm tokens, the hourly
+send counters, and `send_draft` idempotency keys live in the state backend: process memory by
+default, or Redis with `EWS_STATE_BACKEND=redis` (no mail content is stored there). See
 [DEPLOYMENT.md](DEPLOYMENT.md#the-data-directory) and [CONFIGURATION.md](CONFIGURATION.md#storage).
 
 ## The audit chain
@@ -504,10 +555,11 @@ Audit writes are best effort: a failed write does not fail the tool call. See
   whitespace around dots and warns when a whitespace-free token mixes ASCII letters with non-ASCII
   characters; pure non-Latin link text such as Arabic gets no warning.
 - **Attachment byte hashes and in-memory token state.** `send_draft` binds attachments by `id`,
-  `name`, and `size`, not by hashing attachment byte content. Single-use token tracking, the hourly
-  send counter, and `idempotency_key` records live in process memory only, so a restart resets the
-  send counter and, if `SEND_CONFIRM_SECRET` is pinned across a restart, an unexpired token could
-  be replayed within `CONFIRM_TTL_SECONDS`.
+  `name`, and `size`, not by hashing attachment byte content. With the default in-process state
+  backend, single-use token tracking, the hourly send counters, and `idempotency_key` records are
+  lost on restart, so a restart resets the send counters and, if `SEND_CONFIRM_SECRET` is pinned
+  across a restart, an unexpired token could be replayed within `CONFIRM_TTL_SECONDS`.
+  `EWS_STATE_BACKEND=redis` closes both gaps.
 - **Idempotent replay of `send_draft` requires the raw EWS id.** A retry with the same
   `idempotency_key` is recognised as a replay, and answered with `replayed: true` without sending
   again, only when `draft_id` is the raw EWS id. With a `d` alias the retry is treated as a new

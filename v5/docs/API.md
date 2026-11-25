@@ -691,8 +691,8 @@ registered: it is absent from the tool list, and calling it returns `validation`
 | `recipient_blocked` | 403 | Recipient in `to`, `cc`, `bcc`, or `attendees` matched `EWS_RECIPIENT_DENYLIST` or missed `EWS_RECIPIENT_ALLOWLIST`, or a stored event attendee has no address while a list is set. | Remove the blocked or unverifiable recipient, or ask the operator to update the recipient lists. |
 | `not_found` | 404 | Stale raw EWS id (`ErrorItemNotFound` / `ErrorInvalidId`), missing folder/contact/attachment/rule, `a` alias issued for another message's attachment, or unknown `m`-alias in `get_messages`. | Re-run `search_messages`, `list_folders`, `list_events`, `find_people`, or `list_rules` to get fresh ids, then retry. |
 | `confirm_invalid` | 409 | `confirm_token` is malformed, bad-signature, expired (`CONFIRM_TTL_SECONDS`), already consumed, or stale after arguments or target content changed. | Call again **without** `confirm_token` for a fresh preview, inspect the updated preview, and confirm with the new token. |
-| `throttled` | 429 | Exchange back-off (`ErrorServerBusy` / rate limit); includes `retry_after_s` (default `60`). Counts toward the circuit-breaker failure counter (`ctx._circuit_failures`). | Wait at least `retry_after_s` seconds before retrying. |
-| `rate_capped` | 429 | Confirmed sending call hit the per-process `EWS_MAX_SENDS_PER_HOUR` cap (default `10`/hour); returns `retry_after_s` and preserves `confirm_token`. | Wait `retry_after_s` seconds and retry the same call with the same `confirm_token` if it has not expired (or call without `confirm_token` for a new preview if it expired). |
+| `throttled` | 429 | Exchange asked the mailbox to back off (`ErrorServerBusy`, `RateLimitError`), with `retry_after_s` from Exchange's own stated wait (default `60`); or the call was not sent because a back-off Exchange stated for this mailbox is still running, or (bearer mode) no Exchange worker became free within `EWS_QUEUE_TIMEOUT_SECONDS`. Only errors from Exchange count toward the circuit-breaker failure counter. | Wait at least `retry_after_s` seconds before retrying; prefer fewer, narrower calls. |
+| `rate_capped` | 429 | Confirmed sending call hit the per-mailbox `EWS_MAX_SENDS_PER_HOUR` cap (default `10`/hour) or the all-mailbox `EWS_GLOBAL_MAX_SENDS_PER_HOUR` cap, which preserves `confirm_token`; or the mailbox used its `EWS_MAILBOX_CALLS_PER_MINUTE` call budget (bearer mode). Returns `retry_after_s`. | Wait `retry_after_s` seconds and retry the same call (with the same `confirm_token` if it has not expired, or without it for a new preview). |
 | `internal` | 500 | Used only for an unwritable `DATA_DIR/attachments` folder or an unavailable document worker (`WORKER_UNAVAILABLE_ERROR_MESSAGE`). Does not count toward the circuit-breaker failure counter (`ctx._circuit_failures`). | Ask the operator to check local disk space, `DATA_DIR/attachments` permissions, or OS process limits. |
 | `upstream_error` | 502 | Exchange failed the operation, all attendees failed in `check_availability`, final delete of a neutralised disabled rule failed, or an unexpected local exception reached `map_exception`. Counts as a failure toward the circuit breaker. | Inspect `message` and `hint`; retry once if transient, otherwise check mailbox state. |
 | `upstream_unavailable` | 503 | Exchange still `connecting`, transport/timeout failure, open circuit breaker, or required local mirror / semantic index not ready (`retry_after_s` when applicable). | Call `get_server_status` (or `/readyz` on HTTP) and wait `retry_after_s` seconds before retrying. |
@@ -721,7 +721,7 @@ registered: it is absent from the tool list, and calling it returns `validation`
 
 #### `rate_capped`
 
-- Counts confirmed calls that send — `send_draft`, `respond_to_event`, `set_oof`, invitations, update notices, and cancellations — against the per-process in-memory `EWS_MAX_SENDS_PER_HOUR` cap (default `10`/hour) and includes `retry_after_s` (at least `1`).
+- Counts confirmed calls that send — `send_draft`, `respond_to_event`, `set_oof`, invitations, update notices, and cancellations — against the per-mailbox `EWS_MAX_SENDS_PER_HOUR` cap (default `10`/hour) and the optional all-mailbox `EWS_GLOBAL_MAX_SENDS_PER_HOUR` cap, kept in the state backend (in the process by default; shared by every process with `EWS_STATE_BACKEND=redis`), and includes `retry_after_s` (at least `1`).
 - Checked after token verification and already-used check, and before `confirm_token` is consumed, so a refused call keeps its token.
 
 #### `upstream_unavailable`
@@ -822,8 +822,8 @@ returns a preview plus a single-use HMAC token; repeating the call with identica
    The server re-runs the preview hook when present and verifies the HMAC signature, expiry,
    mailbox, tool name, `target_id`, and content hash, failing with `confirm_invalid` when the token
    is wrong, expired, or bound to other content. An already-used token also fails immediately with
-   `confirm_invalid`. Next, for every call that sends, the server checks in-memory per-process
-   `EWS_MAX_SENDS_PER_HOUR` and refuses with `rate_capped` and `retry_after_s` >= `1` when full;
+   `confirm_invalid`. Next, for every call that sends, the server checks the mailbox's
+   `EWS_MAX_SENDS_PER_HOUR` window (and `EWS_GLOBAL_MAX_SENDS_PER_HOUR` when set) and refuses with `rate_capped` and `retry_after_s` >= `1` when full;
    only after passing the cap is `confirm_token` consumed and the handler executed, so a
    `rate_capped` call keeps its token and succeeds once the hour has room if the token has not
    expired.
@@ -938,7 +938,7 @@ Every dispatched call passes these gates in exact order (`ewsmcp/tools/base.py`)
 - When `spec.sends_mail(kwargs, content)` is true (including `cancel_event` with `action="cancel"`), requires `SEND_ENABLED=true` at phase 1 before issuing a token.
 - Checks resolved recipients (stored draft recipients or stored event attendees) against `EWS_RECIPIENT_DENYLIST` and `EWS_RECIPIENT_ALLOWLIST` when either list is set: refuses disallowed addresses and addressless event attendees (`attendees_without_address`) with `recipient_blocked`, and refuses non-SMTP values (directory names, or addressless draft recipients on `send_draft`) with `validation`.
 - Phase 1 returns `preview` + `confirm_token`.
-- Phase 2 verifies `confirm_token`, rejects already-used tokens (`confirm_invalid`), reserves an in-memory per-process `EWS_MAX_SENDS_PER_HOUR` slot for sending calls (`10`/hour default, `retry_after_s` >= `1`; refusal preserves the token), and only then consumes `confirm_token`.
+- Phase 2 verifies `confirm_token`, rejects already-used tokens (`confirm_invalid`), reserves a per-mailbox `EWS_MAX_SENDS_PER_HOUR` slot (and an `EWS_GLOBAL_MAX_SENDS_PER_HOUR` slot when set) for sending calls (`10`/hour default, `retry_after_s` >= `1`; refusal preserves the token), and only then consumes `confirm_token`.
 
 #### Step 10 — Handler & audit log
 

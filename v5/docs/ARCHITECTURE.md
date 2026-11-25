@@ -39,6 +39,21 @@ Blocking `exchangelib` calls run in `EWSGateway` on a bounded thread pool with a
 One `SyncEngine` per `DATA_DIR`, elected by an OS lock on `sync.lock`, keeps `mirror.db` warm.
 Untrusted attachment documents are parsed in a separate child process with time and memory caps.
 
+### Many mailboxes (bearer mode)
+
+With `EWS_AUTH_MODE=bearer` one process serves many users. The picture above holds per call, with
+four differences, described in full in [SCALING.md](SCALING.md):
+
+- The HTTP layer reads the caller's EWS access token (`ewsmcp/identity.py`); no token means `401`.
+- `dispatch` binds each call to the caller's session (`ewsmcp/sessions.py`): one gateway per token,
+  and the mailbox's own alias namespace, audit chain, circuit and optional mirror, opened only
+  after Exchange accepted the token once. There is no `ConnectionManager` and no background sync.
+- Limits that protect Exchange (`ewsmcp/throttle.py`, the `WorkerGate` in
+  `ewsmcp/gateway/client.py`, the upstream circuit in `SessionPool`) refuse before anything is
+  sent.
+- Facts every process must agree on — spent tokens, send windows, budgets, back-offs, receipts,
+  aliases — live in `ewsmcp/state.py`, in-process or in Redis.
+
 ## A tool call, step by step
 
 Every MCP `call_tool` request and every REST `POST /api/tools/{name}` request converges on
@@ -296,7 +311,7 @@ notices, responses, and cancellations — is sent by the calendar tools:
 While `SEND_ENABLED` is `false`, nothing in this table that sends is allowed: every sending call is
 refused with `kill_switch` at phase 1 before any token is issued. Invitations and update notices
 need only tier `draft`, `SEND_ENABLED=true`, and a confirmation. The hourly cap counts every
-confirmed call that sends in an in-memory per-process window that resets on restart. At phase 2 a
+confirmed call that sends in a rolling per-mailbox window kept in the state backend (in the process by default; shared by every process with `EWS_STATE_BACKEND=redis`). At phase 2 a
 send slot is reserved after `verify_token` and `token_consumed` and before `consume_token` — and
 released if `consume_token` finds the token was concurrently spent — so a `rate_capped` refusal
 leaves the token unspent.
@@ -535,6 +550,11 @@ Every Python module under `v5/ewsmcp/`:
 | `ewsmcp/ids.py` | SQLite-backed short alias store (`IdAliaser`), batch minting, move rebinding, and `NullAliaser`. |
 | `ewsmcp/normalize.py` | Symmetric Arabic orthography and digit folding (`normalize_ar`) shared by FTS5 indexing and search queries. |
 | `ewsmcp/semantic.py` | Optional `SemanticIndex` protocol, `PgVectorSemanticIndex` backed by Postgres + Ollama, `rrf_merge`, and `build_semantic_index`. |
+| `ewsmcp/identity.py` | Bearer mode: `Principal` (mailbox, token fingerprint, expiry, optional stable subject), claim parsing without signature checks, `mailbox_key`, and the request-scoped `CURRENT_PRINCIPAL`. |
+| `ewsmcp/sessions.py` | Bearer mode: `SessionPool` and `MailboxSession` — per-user gateways and stored parts, token proof, rejected-token memory, idle/LRU eviction, and the process-wide upstream circuit. |
+| `ewsmcp/state.py` | Shared state backend: `LocalState` (in-process) and `RedisState` for spent tokens, send windows, call budgets, back-off markers and receipts. |
+| `ewsmcp/throttle.py` | Exchange protection gates: per-mailbox call budget, Exchange's stated back-off, and `LocalRefusal`. |
+| `ewsmcp/content.py` | Nonce-marked `<untrusted-content>` wrapping of sender-written text and the client notice. |
 | `ewsmcp/bodyclean.py` | Quote and signature stripping, word-boundary truncation, and the linear-time `html_to_text_bounded` converter. |
 | `ewsmcp/htmlsafe.py` | Allow-list HTML sanitizer for draft bodies and eight-reading URL/mismatch inspector for `send_draft` previews. |
 | `ewsmcp/extract.py` | Bounded in-memory text extractors for PDF, Word, Excel, PowerPoint, `.eml`, attached messages, HTML, and plain text. |
@@ -544,7 +564,8 @@ Every Python module under `v5/ewsmcp/`:
 | `ewsmcp/cache/__init__.py` | Re-exports `CacheStore`, `SyncEngine`, and `SyncLease`. |
 | `ewsmcp/cache/lease.py` | Cross-platform non-blocking `sync.lock` lease electing one sync leader per `DATA_DIR`. |
 | `ewsmcp/cache/store.py` | SQLite WAL mirror schema, FTS5 search, overview/thread/waiting-on queries, write-through helpers, and learned signatures. |
-| `ewsmcp/cache/sync.py` | Two-lane background `SyncEngine` pulling mail, folder, calendar, and task deltas into `CacheStore`. |
+| `ewsmcp/cache/sync.py` | Two-lane background `SyncEngine` (static mode) pulling mail, folder, calendar, and task deltas into `CacheStore`. |
+| `ewsmcp/cache/window.py` | Bearer mode: `WindowSync`, the on-demand, bounded window refresh of one active user's snippet mirror. |
 | `ewsmcp/gateway/__init__.py` | Re-exports `EWSGateway` and `ConnectionManager`. |
 | `ewsmcp/gateway/client.py` | Thread-pooled `exchangelib` wrapper, `RejectingFaultTolerance`, `AuthBreaker`, `WELL_KNOWN` folder resolver, and `paginate`. |
 | `ewsmcp/gateway/connection.py` | Background warmup and heartbeat state machine (`connecting`, `warm`, `degraded`, `auth_failed`). |

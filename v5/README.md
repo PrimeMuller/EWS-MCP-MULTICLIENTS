@@ -17,6 +17,7 @@ outgoing sends until you explicitly enable and confirm them.
 | [`docs/CONFIGURATION.md`](docs/CONFIGURATION.md) | Every environment setting, its default, limits, and meaning |
 | [`docs/SAFETY.md`](docs/SAFETY.md) | Capability tiers, kill-switch, recipient rules, two-phase confirmation, and limits |
 | [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) | Running over `stdio`, several clients, HTTP, Docker, Compose, health, and storage |
+| [`docs/SCALING.md`](docs/SCALING.md) | One deployment for many users (bearer mode): per-user tokens, isolation, Exchange protection, Redis, pods, and sizing |
 | [`docs/TROUBLESHOOTING.md`](docs/TROUBLESHOOTING.md) | Symptoms, causes, fixes, and error codes |
 | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | How the server is built: mirror, dispatcher, sanitiser, document worker, and transports |
 | [`docs/UPGRADING.md`](docs/UPGRADING.md) | Changes between 4.5 releases and migrating from the legacy 4.0 line |
@@ -154,7 +155,7 @@ Exchange actually holds before anything leaves the mailbox:
 4. **Show the preview to the user.** The assistant presents the server-returned recipients,
    subject, body snippet, attachments, link hosts, and warnings, then waits for approval.
 5. **Confirm and send.** Calling `send_draft(draft_id="d1", confirm_token="…")` verifies the token,
-   rejects an already-used token with `confirm_invalid`, and checks the in-memory per-process
+   rejects an already-used token with `confirm_invalid`, and checks the mailbox's
    `EWS_MAX_SENDS_PER_HOUR` cap — `10` per hour by default across all confirmed calls that send —
    before consuming the token. A call refused with `rate_capped` keeps its token, which works
    again once the hour has room if it has not expired. Otherwise the server re-fetches `d1` under

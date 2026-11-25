@@ -1,8 +1,10 @@
 # Configuration
 
 Every setting in `ews-mcp` comes from an environment variable and defaults to a safe posture:
-`draft` tier, sending off, local `stdio` transport, and local-only storage. Only `EWS_SERVER_URL`
-and `EWS_EMAIL` are required to start the server.
+`draft` tier, sending off, local `stdio` transport, and local-only storage. In the default static
+mode only `EWS_SERVER_URL` and `EWS_EMAIL` are required to start the server; in bearer mode (one
+deployment for many users, see [Many mailboxes](#many-mailboxes-bearer-mode)) `EWS_SERVER_URL`,
+`EWS_AUTH_MODE=bearer` and `MCP_TRANSPORT=http` are enough.
 
 ## How settings are read
 
@@ -80,10 +82,11 @@ the background without exiting the process.
 |---|---|---|---|
 | `EWS_WARMUP_MAX_BACKOFF_SECONDS` | `300` | - | Maximum exponential-backoff ceiling in seconds during background warmup and reconnects, starting from `1` s with full jitter. |
 | `EWS_HEARTBEAT_SECONDS` | `600` | - | Seconds between background `GetFolder` liveness probes while warm. Values `<= 0` disable the heartbeat loop. |
-| `EWS_RETRY_MAX_WAIT_SECONDS` | `300` | - | Maximum retry window in seconds for `exchangelib` on non-401 transient errors such as HTTP 503 or SOAP `ErrorServerBusy`. HTTP 401 never retries. |
+| `EWS_RETRY_MAX_WAIT_SECONDS` | `5` | ge 0, le 3600 | Longest back-off `exchangelib` may sleep inside a worker on non-401 transient errors such as HTTP 503 or SOAP `ErrorServerBusy`; a longer wait requested by Exchange is returned to the caller as `throttled` with `retry_after_s`. HTTP 401 never retries. |
 | `EWS_AUTH_FAILURE_COOLDOWN_SECONDS` | `900` | ge 60 | Seconds the authentication lockout guard blocks all Exchange calls after an HTTP 401 before allowing one recovery probe. |
 | `EWS_AUTH_MAX_REJECTIONS` | `3` | ge 1, le 10 | Rejected credential submissions since the last successful login, including concurrent in-flight calls, before the lockout guard stays open until restart. |
-| `EWS_MAX_CONCURRENCY` | `4` | - | Worker thread-pool size for blocking Exchange calls; clamped at runtime to at least `1`. |
+| `EWS_MAX_CONCURRENCY` | `4` static, `32` bearer | ge 1, le 512 | Worker thread-pool size for blocking Exchange calls: the cap on Exchange requests in flight from one process, across every mailbox. |
+| `EWS_MAILBOX_MAX_CONCURRENCY` | `2` | ge 1, le 8 | Exchange requests one mailbox may have in flight per process (also its `exchangelib` connection count). |
 | `CIRCUIT_FAILURE_THRESHOLD` | `5` | - | Consecutive tool calls failing with `upstream_unavailable`, `upstream_error` (including unexpected local exceptions), or `throttled` before the dispatcher opens its circuit breaker. |
 | `CIRCUIT_OPEN_SECONDS` | `60` | - | Seconds the dispatcher circuit breaker stays open once tripped, refusing Exchange-backed tools with `upstream_unavailable` and `retry_after_s`. |
 
@@ -103,8 +106,8 @@ the background without exiting the process.
   [`SAFETY.md`](SAFETY.md#the-lockout-guard).
 - Lower `EWS_MAX_CONCURRENCY` if Exchange returns `throttled` errors, or raise it slightly when one
   HTTP server handles heavy parallel read traffic.
-- Shorten `EWS_RETRY_MAX_WAIT_SECONDS` if you want failing live calls to return `throttled` or
-  `upstream_unavailable` faster during an Exchange outage.
+- Keep `EWS_RETRY_MAX_WAIT_SECONDS` short: a longer value lets one call hold a worker thread
+  while Exchange asks it to wait, instead of returning `retry_after_s` to the caller.
 
 ## Safety
 
@@ -120,7 +123,7 @@ runs in the central dispatcher before a tool handler executes; full details live
 | `CONFIRM_TTL_SECONDS` | `600` | - | Lifetime of a two-phase `confirm_token` in seconds. |
 | `EWS_RECIPIENT_ALLOWLIST` | `(empty)` | - | Comma-separated `fnmatch` address globs allowed on recipient-bearing tools; stored event attendees with no address fail with `recipient_blocked`. Empty permits all addresses not matched by `EWS_RECIPIENT_DENYLIST`. |
 | `EWS_RECIPIENT_DENYLIST` | `(empty)` | - | Comma-separated `fnmatch` address globs blocked before the allowlist is checked; when set, stored event attendees with no address also fail with `recipient_blocked`. |
-| `EWS_MAX_SENDS_PER_HOUR` | `10` | - | Rolling 3600-second in-memory per-process cap on every confirmed call that sends; returns `rate_capped` when full. Values `<= 0` disable the cap. |
+| `EWS_MAX_SENDS_PER_HOUR` | `10` | - | Rolling 3600-second per-mailbox cap on every confirmed call that sends; returns `rate_capped` when full. Values `<= 0` disable the cap. `EWS_GLOBAL_MAX_SENDS_PER_HOUR` adds a cap across all mailboxes. |
 | `EWS_ATTACHMENT_DIR` | `(empty)` | - | Single local directory from which `create_draft` and `add_draft_attachment` may read relative `path` files. Empty disables file-path attachments. |
 | `EWS_MAX_ATTACHMENT_MB` | `25` | ge 1, le 50 | Per-call attachment and `.eml` export ceiling in MiB. Also sizes the HTTP request body limit at startup as `bytes * 4 // 3 + 1 MiB`. |
 | `EWS_KEEP_DUMPABLE` | `False` | - | When `False` on Linux, marks the server process non-dumpable (`PR_SET_DUMPABLE=0`) before starting attachment-extraction workers. Set `True` only for `ptrace` or core-dump debugging. |
@@ -138,7 +141,8 @@ runs in the central dispatcher before a tool handler executes; full details live
 
 - Counts every confirmed call that sends in a rolling 3600-second window: `send_draft`,
   `respond_to_event`, `set_oof`, invitations, update notices, and cancellations.
-- Tracked in memory per process, so a restart resets the counter; values `<= 0` disable the cap.
+- Counted per mailbox and kept in the state backend (in the process by default; shared by every process with `EWS_STATE_BACKEND=redis`); in-process windows reset on restart. Values `<= 0`
+  disable the cap.
 - Checked at phase two after `confirm_token` is verified and before it is consumed, returning
   `rate_capped` with `retry_after_s >= 1` so a capped call keeps its token until expiry.
 
@@ -324,19 +328,26 @@ concurrent SQLite WAL files, and breaks OS file locks on `cache/sync.lock`.
 
 ## The local mirror
 
-These settings control the per-mailbox SQLite mirror at `DATA_DIR/cache/mirror.db` and its
-background `SyncFolderItems` delta sync in `ewsmcp/cache/sync.py`. Warm reads come from SQLite with
+These settings control the SQLite mirror. In static mode it lives at `DATA_DIR/cache/mirror.db`
+and is kept warm by the background `SyncFolderItems` delta sync in `ewsmcp/cache/sync.py`. In
+bearer mode it is opt-in, one small file per active user under `DATA_DIR/mailboxes/<key>/cache`,
+refreshed only by that user's calls (`ewsmcp/cache/window.py`) and deleted when the session goes
+idle; see [SCALING.md](SCALING.md#live-reads-and-the-optional-mirror). Warm reads come from SQLite with
 `"source": "cache"` and an `"as_of"` timestamp; uncached folders, `fresh=true` calls, and cache
 errors fall back to live Exchange automatically.
 
 | setting | default | limits | what it does |
 |---|---|---|---|
-| `EWS_CACHE_ENABLED` | `True` | - | Enable the SQLite mirror and background delta sync. When `False`, reads go live to Exchange; `waiting_on` and `find_similar` require the mirror. |
+| `EWS_CACHE_ENABLED` | `True` static, `False` bearer | - | Enable the SQLite mirror. When `False`, reads go live to Exchange; `waiting_on` and `find_similar` require the mirror. |
 | `EWS_CACHE_FOLDERS` | `'inbox,sent'` | - | Comma-separated well-known `Account` folder names kept warm via `SyncFolderItems`, such as `inbox`, `sent`, `drafts`, `trash`, `junk`, or `outbox`. |
 | `EWS_CACHE_SYNC_SECONDS` | `45` | - | Sleep interval in seconds between mail delta-sync cycles; clamped at runtime to at least `5` s. |
 | `EWS_CACHE_HIERARCHY_SECONDS` | `600` | - | Minimum interval in seconds between slow-lane syncs of the folder tree, 14-day calendar window (up to 200 events), and tasks; clamped at runtime to at least `60` s. |
-| `EWS_CACHE_WINDOW_DAYS` | `365` | - | Age window in days for mirrored mail; delta items older than `now - EWS_CACHE_WINDOW_DAYS` are skipped after fetch. |
-| `EWS_CACHE_PURGE_ON_BOOT` | `False` | - | Wipe all mirror tables on startup in the sync-lease leader and resync from scratch. |
+| `EWS_CACHE_WINDOW_DAYS` | `365` static, `14` bearer | ge 1 | Age window in days for mirrored mail. |
+| `EWS_CACHE_BODY_CHARS` | `20000` static, `300` bearer | ge 0, le 20000 | Cleaned body kept per mirrored message. Below `20000` the mirror holds snippets: full reads and free-text search go live. |
+| `EWS_CACHE_REFRESH_SECONDS` | `60` | ge 15 | Bearer mode: minimum gap between refreshes of one user's mirror. |
+| `EWS_CACHE_MAX_CONCURRENT_REFRESHES` | `4` | ge 1, le 64 | Bearer mode: mirror refreshes running at once per process; beyond it a refresh is skipped. |
+| `EWS_CACHE_MAX_WINDOW_ITEMS` | `1000` | ge 50, le 5000 | Bearer mode: newest items mirrored per folder. |
+| `EWS_CACHE_PURGE_ON_BOOT` | `False` | - | Wipe all mirror tables on startup in the sync-lease leader and resync from scratch (static mode). |
 
 **When to change it:**
 
@@ -392,6 +403,30 @@ text slices (`20,000` characters) have separate fixed caps in code.
 - Leave `DEFAULT_PAGE_SIZE` at `20`, because values above `50` fail startup validation; pass
   `limit` per tool call to control page sizes.
 
+## Many mailboxes (bearer mode)
+
+`EWS_AUTH_MODE=bearer` serves every user from one deployment: each HTTP request carries the user's
+own EWS OAuth2 access token and the server acts on that user's mailbox only. How it works, how it
+protects Exchange and how to size it: [SCALING.md](SCALING.md).
+
+| setting | default | limits | what it does |
+|---|---|---|---|
+| `EWS_AUTH_MODE` | `'static'` | `static`, `bearer` | `bearer` requires `MCP_TRANSPORT=http`, refuses `EWS_SEMANTIC_INDEX=pgvector`, and needs no `EWS_EMAIL`/password. |
+| `EWS_TOKEN_MAILBOX_CLAIMS` | `'email,upn,preferred_username,unique_name'` | - | Token claims holding the mailbox address, first match wins. |
+| `EWS_TOKEN_IDENTITY_CLAIM` | `None` | - | Stable user id claim (e.g. `sid`); when set it is required and keys the user's stored state. |
+| `EWS_MAILBOX_IDLE_SECONDS` | `1800` | ge 60 | Idle time before a user's session (connections, mirror) is closed. |
+| `EWS_MAX_MAILBOXES` | `2000` | ge 1 | Sessions per process before the least recently used idle ones close. |
+| `EWS_MAILBOX_CALLS_PER_MINUTE` | `0` static, `60` bearer | ge 0 | Tool calls per mailbox per minute; `rate_capped` beyond it. |
+| `EWS_QUEUE_TIMEOUT_SECONDS` | `10` | ge 0.5, le 120 | Longest wait for a free Exchange worker before a call is shed with `throttled`. |
+| `EWS_GLOBAL_CIRCUIT_THRESHOLD` | `20` | ge 0 | Consecutive "Exchange unreachable" outcomes across mailboxes that pause every call for `CIRCUIT_OPEN_SECONDS` (`0` disables). |
+| `EWS_FANOUT_MAX_FOLDERS` | `50` | ge 1, le 200 | Folders one `f:all` / `recursive` search may query (both modes). |
+| `EWS_GLOBAL_MAX_SENDS_PER_HOUR` | `0` | ge 0 | Sends per rolling hour across all mailboxes (`0` disables). |
+| `EWS_STATE_BACKEND` | `'local'` | `local`, `redis` | Where spent tokens, send windows, budgets, back-offs, receipts and (in bearer mode) aliases live. Use `redis` with more than one process. |
+| `EWS_REDIS_URL` | `None` | - | Redis/Valkey URL for `EWS_STATE_BACKEND=redis` (from the environment or a secret). |
+| `EWS_STATE_PREFIX` | `'ewsmcp'` | `[A-Za-z0-9_.-]{1,40}` | Prefix of every key in the shared store. |
+| `EWS_ALIAS_TTL_SECONDS` | `604800` | ge 3600 | How long a user's short ids stay resolvable in Redis after last use. |
+| `EWS_MARK_UNTRUSTED_CONTENT` | `False` static, `True` bearer | - | Wrap message bodies, meeting descriptions and attachment text in nonce-marked `<untrusted-content>` blocks. |
+
 ## All settings
 
 Every setting from `ewsmcp/config.py` in one reference table:
@@ -399,7 +434,7 @@ Every setting from `ewsmcp/config.py` in one reference table:
 | setting | default | limits | meaning |
 |---|---|---|---|
 | `EWS_SERVER_URL` | `(required)` | - | Exchange EWS endpoint URL, such as `https://mail.example.com/EWS/Exchange.asmx`. |
-| `EWS_EMAIL` | `(required)` | - | Primary SMTP address of the mailbox; also login fallback, token mailbox binding, and internal-domain reference. |
+| `EWS_EMAIL` | `(required in static mode)` | - | Primary SMTP address of the mailbox; also login fallback, token mailbox binding, and internal-domain reference. Unused in bearer mode. |
 | `EWS_USERNAME` | `None` | - | Exchange login username; falls back to `EWS_EMAIL` when `None`. |
 | `EWS_PASSWORD` | `None` | - | Exchange account password; treated as `""` when `None`. |
 | `EWS_AUTH_TYPE_FORCE` | `None` | - | Pin `basic`, `ntlm`, or `digest` to skip auth probing; `None` or blank auto-negotiates. |
@@ -408,10 +443,11 @@ Every setting from `ewsmcp/config.py` in one reference table:
 | `REQUEST_TIMEOUT` | `30` | - | Per-request Exchange HTTP timeout in seconds. |
 | `EWS_WARMUP_MAX_BACKOFF_SECONDS` | `300` | - | Maximum exponential-backoff delay in seconds during warmup and reconnects. |
 | `EWS_HEARTBEAT_SECONDS` | `600` | - | Seconds between live Exchange liveness probes while warm (`<= 0` disables). |
-| `EWS_RETRY_MAX_WAIT_SECONDS` | `300` | - | Maximum retry wait in seconds for `exchangelib` on non-401 transient errors. |
+| `EWS_RETRY_MAX_WAIT_SECONDS` | `5` | ge 0, le 3600 | Longest in-worker wait on an Exchange back-off; longer waits return `throttled` with `retry_after_s`. |
 | `EWS_AUTH_FAILURE_COOLDOWN_SECONDS` | `900` | ge 60 | Cooldown in seconds after an HTTP 401 rejection before one recovery probe may run. |
 | `EWS_AUTH_MAX_REJECTIONS` | `3` | ge 1, le 10 | Rejected credential submissions since the last successful login before staying in `auth_failed` until restart. |
-| `EWS_MAX_CONCURRENCY` | `4` | - | Worker thread-pool size for blocking Exchange calls (clamped to `>= 1`). |
+| `EWS_MAX_CONCURRENCY` | `4` static, `32` bearer | ge 1, le 512 | Exchange requests in flight per process, across every mailbox. |
+| `EWS_MAILBOX_MAX_CONCURRENCY` | `2` | ge 1, le 8 | Exchange requests in flight per mailbox per process. |
 | `CIRCUIT_FAILURE_THRESHOLD` | `5` | - | Consecutive upstream or throttle tool failures that open the dispatcher circuit. |
 | `CIRCUIT_OPEN_SECONDS` | `60` | - | Seconds the dispatcher circuit stays open, refusing Exchange-backed tools with `upstream_unavailable` while `get_server_status`, `waiting_on`, and `find_similar` still answer. |
 | `EWS_CAPABILITY_TIER` | `'draft'` | - | `read`, `draft`, or `full` capability tier; tools above the tier are not registered. |
@@ -420,7 +456,7 @@ Every setting from `ewsmcp/config.py` in one reference table:
 | `CONFIRM_TTL_SECONDS` | `600` | - | Two-phase confirm token lifetime in seconds. |
 | `EWS_RECIPIENT_ALLOWLIST` | `(empty)` | - | Comma-separated `fnmatch` globs of permitted recipient addresses (empty allows all). |
 | `EWS_RECIPIENT_DENYLIST` | `(empty)` | - | Comma-separated `fnmatch` globs of blocked recipient addresses, checked before the allowlist. |
-| `EWS_MAX_SENDS_PER_HOUR` | `10` | - | In-memory per-process rolling 1-hour cap on every confirmed call that sends; checked before `confirm_token` is consumed (`<= 0` disables). |
+| `EWS_MAX_SENDS_PER_HOUR` | `10` | - | Per-mailbox rolling 1-hour cap on every confirmed call that sends, kept in the state backend (shared across processes with Redis); checked before `confirm_token` is consumed (`<= 0` disables). |
 | `EWS_ATTACHMENT_DIR` | `(empty)` | - | Local directory from which draft tools may read relative `path` attachments (empty disables). |
 | `EWS_MAX_ATTACHMENT_MB` | `25` | ge 1, le 50 | Per-call size ceiling in MiB for attachments and `.eml` exports; sizes the HTTP body limit. |
 | `EWS_KEEP_DUMPABLE` | `False` | - | Keep Linux process dumpability enabled instead of setting `PR_SET_DUMPABLE=0` before worker spawn. |
@@ -431,11 +467,12 @@ Every setting from `ewsmcp/config.py` in one reference table:
 | `LOG_LEVEL` | `'INFO'` | - | Log level for Python `stderr` and `uvicorn`. |
 | `DATA_DIR` | `(empty)` | - | Local storage directory (empty resolves to `~/.ewsmcp`); cloud-synced folders are refused. |
 | `DATA_DIR_ALLOW_SYNCED` | `False` | - | Opt out of the cloud-synced folder check on `DATA_DIR`. |
-| `EWS_CACHE_ENABLED` | `True` | - | Enable the local SQLite mailbox mirror and background delta sync. |
+| `EWS_CACHE_ENABLED` | `True` static, `False` bearer | - | Enable the local SQLite mailbox mirror (static: background delta sync; bearer: on-demand window). |
 | `EWS_CACHE_FOLDERS` | `'inbox,sent'` | - | Comma-separated mail folders kept warm via `SyncFolderItems` delta sync. |
 | `EWS_CACHE_SYNC_SECONDS` | `45` | - | Fast-lane mail delta-sync interval in seconds (clamped to `>= 5`). |
 | `EWS_CACHE_HIERARCHY_SECONDS` | `600` | - | Slow-lane sync interval in seconds for folders, 14-day calendar window, and tasks (clamped to `>= 60`). |
-| `EWS_CACHE_WINDOW_DAYS` | `365` | - | Mail mirror age window in days (items older than the window are skipped after fetch). |
+| `EWS_CACHE_WINDOW_DAYS` | `365` static, `14` bearer | ge 1 | Mail mirror age window in days. |
+| `EWS_CACHE_BODY_CHARS` | `20000` static, `300` bearer | ge 0, le 20000 | Cleaned body kept per mirrored message (below `20000`: snippets only). |
 | `EWS_CACHE_PURGE_ON_BOOT` | `False` | - | Wipe mirror tables at startup (leader only) and resync from scratch. |
 | `EWS_SEMANTIC_INDEX` | `'none'` | - | Semantic adapter: `'none'` or `'pgvector'`. |
 | `EWS_SEMANTIC_PG_DSN` | `None` | - | PostgreSQL DSN for `pgvector` semantic indexing (requires `psycopg`). |

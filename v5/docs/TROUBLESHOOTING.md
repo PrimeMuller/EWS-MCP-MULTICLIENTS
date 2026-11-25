@@ -242,7 +242,7 @@ breaker is open once their local mirror or semantic index is ready. Over HTTP, `
   within the rolling 3,600-second window. Silent calendar edits and plain appointment deletions do
   not count, while a confirmed sending call that its handler later refuses (such as `create_event`
   with `end` before `start`) still uses one slot and spends its `confirm_token`. The counter is
-  held in memory per process.
+  per mailbox and kept in the state backend (in the process by default; shared by every process with `EWS_STATE_BACKEND=redis`).
 - **Fix:** At phase two, the server verifies the token, rejects already-spent tokens with
   `confirm_invalid`, checks `EWS_MAX_SENDS_PER_HOUR`, and only then consumes the token. Because a
   `rate_capped` refusal keeps its `confirm_token`, wait `retry_after_s` seconds and retry the same

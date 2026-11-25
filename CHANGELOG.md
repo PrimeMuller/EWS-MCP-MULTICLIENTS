@@ -2,6 +2,38 @@
 
 ## [Unreleased]
 
+### Added
+- **Bearer mode (`EWS_AUTH_MODE=bearer`) in `v5/`: one deployment serves many mailboxes.** Each
+  HTTP request carries the user's own EWS OAuth2 access token; the mailbox comes from its claims
+  (`EWS_TOKEN_MAILBOX_CLAIMS`, optionally keyed by `EWS_TOKEN_IDENTITY_CLAIM` such as `sid`); no
+  token means HTTP 401. Each user gets a session with their own connections, alias namespace,
+  audit chain and optional mirror, opened only after Exchange accepted their token once. See
+  `v5/docs/SCALING.md`.
+- **Shared state (`EWS_STATE_BACKEND=redis`)** for spent confirm tokens, send caps, call budgets,
+  Exchange back-offs, idempotency receipts and aliases across processes.
+- **Exchange protection:** per-mailbox request cap (`EWS_MAILBOX_MAX_CONCURRENCY`) and call budget
+  (`EWS_MAILBOX_CALLS_PER_MINUTE`), load shedding when no worker is free
+  (`EWS_QUEUE_TIMEOUT_SECONDS`), Exchange's stated back-offs held per mailbox, a process-wide
+  upstream circuit (`EWS_GLOBAL_CIRCUIT_THRESHOLD`), and an all-mailbox send cap
+  (`EWS_GLOBAL_MAX_SENDS_PER_HOUR`).
+- **On-demand window mirror for bearer mode:** refreshed only by its user's calls, 14 days of
+  headers and 300-character snippets, deleted after 30 idle minutes.
+- **Prompt-injection defences:** text hidden from the reader by CSS or the `hidden` attribute is
+  dropped from bodies, meeting descriptions and HTML attachments (`hidden_text_removed`), and
+  sender-written text can be wrapped in nonce-marked `<untrusted-content>` blocks
+  (`EWS_MARK_UNTRUSTED_CONTENT`, on in bearer mode).
+- Bearer-mode `/metrics` gauges and a bearer-mode boot smoke in CI.
+
+### Changed
+- `EWS_RETRY_MAX_WAIT_SECONDS` defaults to `5` (was `300`): longer back-offs return `throttled`
+  with Exchange's own `retry_after_s` instead of holding a worker thread.
+- Multi-folder search fans out to at most `EWS_FANOUT_MAX_FOLDERS` folders, default `50` (was a
+  fixed `200`).
+- `EWS_MAX_SENDS_PER_HOUR` is counted per mailbox, in the state backend.
+- `gateway.reset()` evicts only its own `CachingProtocol` entry instead of clearing the cache for
+  every connection in the process.
+- The overview's cache path also requires a mirrored calendar.
+
 ## [4.5.0a4] - 2026-11-17
 
 ### Added
