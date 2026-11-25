@@ -17,9 +17,14 @@ Design goals
    pointing at the new raw id — the model never has to re-learn handles.
 3. **SQL safety.** Every query uses parameterised placeholders; never
    f-string values into SQL.
-4. **Persistent and shared.** State lives in ``<memory_dir>/aliases.db``
-   next to the memory store's per-mailbox files, so aliases survive
-   restarts and stay consistent across sessions.
+4. **Persistent, and scoped to ONE mailbox.** State lives in
+   ``<memory_dir>/aliases.db``, so aliases survive restarts. When one
+   process serves many mailboxes each gets its own store under
+   :func:`mailbox_memory_dir` — a separate file, so an alias minted for one
+   person can never resolve to another person's item: isolation holds by
+   construction, not by remembering a ``WHERE mailbox=?`` in every query.
+   Short aliases are small integers (``m12``), trivially guessable, which
+   is exactly why they must never be shared across mailboxes.
 5. **Thread safety.** A per-instance lock plus short-lived connections
    (one per call, WAL mode) keep the aliaser correct under asyncio /
    threaded tool execution; minting is a single ``BEGIN IMMEDIATE``
@@ -452,6 +457,25 @@ def get_aliaser(memory_dir: str) -> IdAliaser:
             aliaser = IdAliaser(memory_dir)
             _ALIASERS[key] = aliaser
         return aliaser
+
+
+def mailbox_memory_dir(data_dir: str, mailbox_key: str) -> str:
+    """Directory of one mailbox's alias store (``identity.mailbox_key``)."""
+    if not mailbox_key or not mailbox_key.isalnum():
+        raise ValueError("mailbox_key must be a non-empty alphanumeric key")
+    return str(Path(data_dir) / "mailboxes" / mailbox_key / "memory")
+
+
+def get_mailbox_aliaser(data_dir: str, mailbox_key: str) -> IdAliaser:
+    """The alias store of one mailbox; never shared with another mailbox."""
+    return get_aliaser(mailbox_memory_dir(data_dir, mailbox_key))
+
+
+def release_aliaser(memory_dir: str) -> None:
+    """Forget the cached instance for ``memory_dir`` (its files stay), so a
+    process serving many mailboxes does not hold one per mailbox forever."""
+    with _ALIASERS_GUARD:
+        _ALIASERS.pop(str(Path(memory_dir).resolve()), None)
 
 
 def reset_aliaser_cache() -> None:

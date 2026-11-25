@@ -225,3 +225,47 @@ def test_kind_for_key_mapping():
     assert kind_for_key("MESSAGE_ID") == "m"  # case-insensitive
     assert kind_for_key("something_else") == "x"
     assert kind_for_key("") == "x"
+
+
+# --- one alias namespace per mailbox -----------------------------------------
+
+
+def test_mailbox_alias_stores_are_isolated(tmp_path):
+    from ewsmcp.identity import mailbox_key
+    from ewsmcp.ids import get_mailbox_aliaser
+
+    alice = get_mailbox_aliaser(str(tmp_path), mailbox_key("alice@corp.example"))
+    bob = get_mailbox_aliaser(str(tmp_path), mailbox_key("bob@corp.example"))
+    assert alice is not bob and alice.db_path != bob.db_path
+
+    a_alias = alice.alias_for("RAW-ALICE-1", "m")
+    b_alias = bob.alias_for("RAW-BOB-1", "m")
+    # Small counters collide on purpose: both mailboxes mint "m1"...
+    assert a_alias == b_alias == "m1"
+    # ...and each resolves only to its own mailbox's item.
+    assert alice.resolve("m1") == "RAW-ALICE-1"
+    assert bob.resolve("m1") == "RAW-BOB-1"
+    alice.alias_for("RAW-ALICE-2", "m")
+    with pytest.raises(KeyError):
+        bob.resolve("m2")  # minted for alice: unknown to bob, never alice's item
+    assert bob.imid_for("RAW-ALICE-1") is None
+
+
+def test_mailbox_alias_store_is_reused_per_mailbox_and_releasable(tmp_path):
+    from ewsmcp.ids import get_mailbox_aliaser, mailbox_memory_dir, release_aliaser
+
+    first = get_mailbox_aliaser(str(tmp_path), "abc123")
+    assert get_mailbox_aliaser(str(tmp_path), "abc123") is first
+    first.alias_for("RAW-1", "m")
+    release_aliaser(mailbox_memory_dir(str(tmp_path), "abc123"))
+    again = get_mailbox_aliaser(str(tmp_path), "abc123")
+    assert again is not first
+    assert again.resolve("m1") == "RAW-1"  # the store itself persists
+
+
+@pytest.mark.parametrize("bad_key", ["", "../etc", "a/b", "a b"])
+def test_mailbox_memory_dir_refuses_unsafe_keys(tmp_path, bad_key):
+    from ewsmcp.ids import mailbox_memory_dir
+
+    with pytest.raises(ValueError):
+        mailbox_memory_dir(str(tmp_path), bad_key)
