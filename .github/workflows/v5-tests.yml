@@ -62,6 +62,9 @@ jobs:
         env:
           EWS_CACHE_ENABLED: "false"
         run: python scripts/boot_smoke.py full
+      - name: Boot smoke (bearer mode, many mailboxes)
+        working-directory: v5
+        run: python scripts/boot_smoke_bearer.py
 
   docker-build:
     needs: [tests, boot-smoke]
