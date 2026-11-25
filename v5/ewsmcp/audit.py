@@ -8,6 +8,11 @@ The chain head (last hash + sequence number) persists in
 silently restarting at GENESIS — without that, deleting a whole day's
 file was undetectable. ``scripts/verify_audit_chain.py`` walks the files
 and re-derives every link.
+
+When one process serves many mailboxes, each mailbox has its own chain
+(:func:`mailbox_audit`) under ``DATA_DIR/mailboxes/<key>/audit`` whose
+records name the acting mailbox: one person's trail can be exported or
+verified on its own, and mailboxes never contend for one chain lock.
 """
 
 import hashlib
@@ -19,8 +24,10 @@ from typing import Any, Dict, Optional
 
 
 class AuditLog:
-    def __init__(self, data_dir: str):
-        self._dir = Path(data_dir) / "audit"
+    def __init__(self, data_dir: str, *, directory: Optional[str] = None,
+                 mailbox: Optional[str] = None):
+        self._dir = Path(directory) if directory else Path(data_dir) / "audit"
+        self._mailbox = mailbox
         self._state_path = self._dir / "chain.state"
         self._lock = threading.Lock()
         self._prev = "GENESIS"
@@ -31,6 +38,10 @@ class AuditLog:
             self._seq = int(state["seq"])
         except Exception:
             pass
+
+    @property
+    def directory(self) -> Path:
+        return self._dir
 
     def record(
         self,
@@ -49,6 +60,8 @@ class AuditLog:
             "latency_ms": latency_ms,
             "transport": transport,
         }
+        if self._mailbox:
+            entry["mailbox"] = self._mailbox
         if detail:
             entry["detail"] = detail
         try:
@@ -71,3 +84,15 @@ class AuditLog:
         except Exception:
             # Auditing must never take a tool call down.
             pass
+
+
+def mailbox_audit_dir(data_dir: str, mailbox_key: str) -> Path:
+    if not mailbox_key or not mailbox_key.isalnum():
+        raise ValueError("mailbox_key must be a non-empty alphanumeric key")
+    return Path(data_dir) / "mailboxes" / mailbox_key / "audit"
+
+
+def mailbox_audit(data_dir: str, mailbox_key: str, mailbox: str) -> AuditLog:
+    """The audit chain of one mailbox; its records name the acting mailbox."""
+    return AuditLog(data_dir, directory=str(mailbox_audit_dir(data_dir, mailbox_key)),
+                    mailbox=mailbox)

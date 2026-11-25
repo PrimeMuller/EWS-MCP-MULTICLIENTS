@@ -13,6 +13,10 @@ and a truncated tail is caught by the ``chain.state`` cross-check.
 
 Usage:
     python scripts/verify_audit_chain.py [DATA_DIR/audit]
+    python scripts/verify_audit_chain.py --all DATA_DIR
+
+``--all`` verifies the process chain (``DATA_DIR/audit``) and every
+mailbox's own chain (``DATA_DIR/mailboxes/<key>/audit``) one by one.
 
 Exit codes: 0 = chain intact, 1 = break detected, 2 = usage/IO error.
 """
@@ -80,7 +84,27 @@ def verify(audit_dir: Path) -> int:
     return 1 if breaks else 0
 
 
+def verify_all(data_dir: Path) -> int:
+    """Verify every chain under a data dir; the worst exit code wins."""
+    chains = [data_dir / "audit"] if (data_dir / "audit").is_dir() else []
+    chains += sorted(p for p in data_dir.glob("mailboxes/*/audit") if p.is_dir())
+    if not chains:
+        print(f"no audit chains under {data_dir}")
+        return 2
+    worst = 0
+    for chain in chains:
+        print(f"== {chain.relative_to(data_dir)}")
+        worst = max(worst, verify(chain))
+    return worst
+
+
 def main() -> int:
+    if len(sys.argv) > 2 and sys.argv[1] == "--all":
+        target = Path(sys.argv[2])
+        if not target.is_dir():
+            print(f"no such directory: {target}")
+            return 2
+        return verify_all(target)
     target = Path(sys.argv[1]) if len(sys.argv) > 1 else Path("data/audit")
     if not target.is_dir():
         print(f"no such directory: {target}")

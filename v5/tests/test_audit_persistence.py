@@ -63,3 +63,53 @@ def test_verifier_catches_truncated_tail(tmp_path):
     lines = path.read_text(encoding="utf-8").strip().splitlines()
     path.write_text("\n".join(lines[:-1]) + "\n", encoding="utf-8")
     assert verifier.verify(audit_dir) == 1  # chain.state no longer matches
+
+
+# --- one chain per mailbox ---------------------------------------------------
+
+
+def test_each_mailbox_has_its_own_chain_naming_the_actor(tmp_path):
+    from ewsmcp.audit import mailbox_audit
+
+    alice = mailbox_audit(str(tmp_path), "aaa111", "alice@corp.example")
+    bob = mailbox_audit(str(tmp_path), "bbb222", "bob@corp.example")
+    _record(alice, 2)
+    _record(bob, 1)
+    assert alice.directory != bob.directory
+    a_lines = [json.loads(line) for path in sorted(alice.directory.glob("audit-*.jsonl"))
+               for line in path.read_text(encoding="utf-8").splitlines()]
+    b_lines = [json.loads(line) for path in sorted(bob.directory.glob("audit-*.jsonl"))
+               for line in path.read_text(encoding="utf-8").splitlines()]
+    assert [r["seq"] for r in a_lines] == [1, 2]
+    assert [r["seq"] for r in b_lines] == [1]  # independent chains
+    assert {r["mailbox"] for r in a_lines} == {"alice@corp.example"}
+    assert {r["mailbox"] for r in b_lines} == {"bob@corp.example"}
+    assert verifier.verify(alice.directory) == 0
+    assert verifier.verify(bob.directory) == 0
+
+
+def test_verify_all_walks_every_mailbox_chain(tmp_path):
+    from ewsmcp.audit import mailbox_audit
+
+    _record(AuditLog(str(tmp_path)), 1)
+    alice = mailbox_audit(str(tmp_path), "aaa111", "alice@corp.example")
+    _record(alice, 2)
+    _record(mailbox_audit(str(tmp_path), "bbb222", "bob@corp.example"), 2)
+    assert verifier.verify_all(tmp_path) == 0
+    path = next(iter(sorted(alice.directory.glob("audit-*.jsonl"))))
+    lines = path.read_text(encoding="utf-8").strip().splitlines()
+    doctored = json.loads(lines[0])
+    doctored["mailbox"] = "someone-else@corp.example"  # re-attribute a call
+    lines[0] = json.dumps(doctored, sort_keys=True, ensure_ascii=False)
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    assert verifier.verify_all(tmp_path) == 1
+
+
+def test_mailbox_audit_dir_refuses_unsafe_keys(tmp_path):
+    import pytest
+
+    from ewsmcp.audit import mailbox_audit_dir
+
+    for bad in ("", "../x", "a/b"):
+        with pytest.raises(ValueError):
+            mailbox_audit_dir(str(tmp_path), bad)
