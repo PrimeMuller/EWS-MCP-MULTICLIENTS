@@ -36,7 +36,13 @@ class Settings(BaseSettings):
     ews_retry_max_wait_seconds: int = 300
     ews_auth_failure_cooldown_seconds: int = Field(default=900, ge=60)
     ews_auth_max_rejections: int = Field(default=3, ge=1, le=10)
+    # Worker threads for Exchange calls: the process-wide cap on requests in
+    # flight across every mailbox.
     ews_max_concurrency: int = 4
+    # Requests ONE mailbox may have in flight (its share of the pool and its
+    # exchangelib connection count). Exchange's own per-user EWS limit is far
+    # higher; staying at 2-3 keeps a single busy assistant a polite guest.
+    ews_mailbox_max_concurrency: int = Field(default=2, ge=1, le=8)
     circuit_failure_threshold: int = 5
     circuit_open_seconds: int = 60
 

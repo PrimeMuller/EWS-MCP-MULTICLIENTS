@@ -245,10 +245,54 @@ def test_folder_class_is_a_real_field():
 
 
 def test_protocol_cache_is_evictable():
-    """gateway.reset() calls CachingProtocol.clear_cache() to force a
-    fresh session + auth negotiation; closing the protocol alone hands
-    the same wedged instance back on the next build."""
+    """gateway.reset()/close() remove THEIR OWN CachingProtocol entry to
+    force a fresh session + auth negotiation (closing the protocol alone
+    hands the same wedged instance back on the next build) without cutting
+    other mailboxes' sessions. That relies on the cache being a dict keyed
+    by ``_cache_key(config)`` == (service_endpoint, credentials), guarded by
+    ``_protocol_cache_lock``, holding ``(protocol, created_at)`` tuples."""
     assert callable(getattr(CachingProtocol, "clear_cache", None))
+    assert isinstance(CachingProtocol._protocol_cache, dict)
+    assert hasattr(CachingProtocol._protocol_cache_lock, "__enter__")
+    config = Configuration(
+        service_endpoint="https://ews.example.com/EWS/Exchange.asmx",
+        credentials=Credentials("svc", "secret"), auth_type=BASIC,
+        version=Version(build=EXCHANGE_2016),
+    )
+    assert CachingProtocol._cache_key(config) == (config.service_endpoint, config.credentials)
+    CachingProtocol.clear_cache()
+    try:
+        proto = Protocol(config=config)
+        entry = CachingProtocol._protocol_cache[CachingProtocol._cache_key(config)]
+        assert entry[0] is proto
+    finally:
+        CachingProtocol.clear_cache()
+
+
+def test_custom_auth_type_plugs_in_through_auth_type_map():
+    """Bearer tokens ride a custom auth type: exchangelib must accept any key
+    registered in transport.AUTH_TYPE_MAP and build each session's auth via
+    get_auth_instance(auth_type, username=..., password=...) for non-OAuth
+    credentials — both pinned here."""
+    from exchangelib.transport import AUTH_TYPE_MAP, get_auth_instance
+
+    from ewsmcp.gateway.client import BEARER, BearerCredentials, BearerTokenAuth
+
+    assert AUTH_TYPE_MAP[BEARER] is BearerTokenAuth
+    auth = get_auth_instance(auth_type=BEARER, username="a@corp.example", password="tok")
+    assert isinstance(auth, BearerTokenAuth)
+    config = Configuration(
+        service_endpoint="https://ews.example.com/EWS/Exchange.asmx",
+        credentials=BearerCredentials("a@corp.example", "tok"), auth_type=BEARER,
+        version=Version(build=EXCHANGE_2016),
+    )
+    CachingProtocol.clear_cache()
+    try:
+        session = Protocol(config=config).create_session()
+        assert isinstance(session.auth, BearerTokenAuth)
+        session.close()
+    finally:
+        CachingProtocol.clear_cache()
 
 
 def test_flag_status_extended_property_pin():

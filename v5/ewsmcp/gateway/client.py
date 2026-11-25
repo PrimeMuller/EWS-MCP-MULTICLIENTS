@@ -1,12 +1,21 @@
-"""EWS gateway — one Account per process, EWS off the event loop.
+"""EWS gateway — one Account per credential, EWS off the event loop.
 
-Authentication auto-negotiation is the default because it adapts to what the
-Exchange server offers; forcing a scheme via ``ews_auth_type_force`` skips the
-unauthenticated probe request and is appropriate when the scheme is known.
+A gateway owns exactly one credential: the configured service credentials
+of static mode, or one caller's bearer token in bearer mode (one gateway per
+token; ``sessions.py`` keeps them per mailbox). Many gateways share one
+bounded worker pool, and each mailbox's gateways share one request-slot
+semaphore, so neither one mailbox nor the whole process can exceed its cap
+on concurrent Exchange requests.
+
+Authentication auto-negotiation is the default for static credentials
+because it adapts to what the Exchange server offers; forcing a scheme via
+``ews_auth_type_force`` skips the unauthenticated probe request. Bearer
+tokens are presented as-is (``Authorization: Bearer``) with no probe.
 
 HTTP 401 credential rejections fail fast via ``RejectingFaultTolerance`` and
 trip the gateway's authentication circuit breaker so a stale password can
-never be resubmitted in a loop or lock out the directory account.
+never be resubmitted in a loop or lock out the directory account, and a
+rejected token is never presented again.
 """
 
 import asyncio
@@ -18,6 +27,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+import requests.auth
 from exchangelib import (
     BASIC,
     DELEGATE,
@@ -35,9 +45,11 @@ from exchangelib.protocol import (
     FaultTolerance,
     NoVerifyHTTPAdapter,
 )
+from exchangelib.transport import AUTH_TYPE_MAP
 
 from ..config import Settings
 from ..errors import AUTH_FAILED_HINT, ToolError
+from ..identity import Principal
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +57,46 @@ logger = logging.getLogger(__name__)
 # library spells NTLM in upper case, so passing the setting through as is
 # made a forced NTLM fail validation before any request was sent.
 AUTH_TYPE_BY_SETTING = {"basic": BASIC, "ntlm": NTLM, "digest": DIGEST}
+
+BEARER_HINT = (
+    "Exchange rejected the access token. Retrying with the same token will "
+    "not help: obtain a fresh token for this user and call again."
+)
+
+
+class BearerTokenAuth(requests.auth.AuthBase):
+    """Present an OAuth2 access token unchanged on every request.
+
+    exchangelib's own OAuth2 auth type drives a token-endpoint flow
+    (client id, refresh, ``TokenExpiredError`` loops). Here the token comes
+    from the caller, is never refreshed, and a rejection is final, so the
+    plain header is all that is needed. Instantiated by exchangelib's
+    ``get_auth_instance(auth_type, username=..., password=...)``.
+    """
+
+    def __init__(self, username: Optional[str] = None, password: Optional[str] = None):
+        self._token = password or ""
+
+    def __call__(self, request: Any) -> Any:
+        request.headers["Authorization"] = f"Bearer {self._token}"
+        return request
+
+
+# exchangelib validates ``Configuration.auth_type`` against this map and
+# builds each session's auth from it; registering the scheme here is how a
+# custom auth type plugs in (pinned in test_exchangelib_signatures.py).
+BEARER = "bearer token"
+AUTH_TYPE_MAP.setdefault(BEARER, BearerTokenAuth)
+
+
+class BearerCredentials(Credentials):
+    """One caller's access token. ``password`` holds the token; exchangelib
+    masks it in ``repr`` and keys its protocol cache on it, so every token
+    gets its own Protocol (and session pool) and nothing is shared between
+    users."""
+
+    def __init__(self, mailbox: str, token: str):
+        super().__init__(mailbox, token)
 
 WELL_KNOWN = {
     "f:inbox": "inbox", "f:sent": "sent", "f:drafts": "drafts",
@@ -343,20 +395,46 @@ class EWSGateway:
         self,
         settings: Settings,
         clock: Optional[Callable[[], float]] = None,
+        *,
+        principal: Optional[Principal] = None,
+        executor: Optional[ThreadPoolExecutor] = None,
+        request_slots: Optional[asyncio.Semaphore] = None,
+        version: Any = None,
     ):
+        """One credential's connection to Exchange.
+
+        ``principal`` carries a bearer token in bearer mode; without one the
+        configured service credentials of static mode are used. ``executor``
+        is the process-wide worker pool (a private one is created when
+        omitted), ``request_slots`` the mailbox's cap on concurrent requests
+        shared by all of its gateways, and ``version`` the server version
+        already learned by another gateway, which spares the per-connection
+        version probe.
+        """
         self.settings = settings
         self._clock = clock
+        self.principal = principal
+        self.mailbox = (
+            principal.mailbox if principal is not None else (settings.ews_email or "")
+        )
+        bearer = principal is not None and principal.is_bearer
         self._breaker = AuthBreaker(
             cooldown_seconds=settings.ews_auth_failure_cooldown_seconds,
-            max_rejections=settings.ews_auth_max_rejections,
+            # A rejected token never becomes valid again: one strike latches
+            # this gateway, and the caller must come back with a new token.
+            max_rejections=1 if bearer else settings.ews_auth_max_rejections,
             clock=clock,
         )
         self._account: Optional[Account] = None
         self._account_lock = threading.Lock()
-        self._pool = ThreadPoolExecutor(
+        self._cache_key: Optional[Tuple[Any, Any]] = None
+        self._owns_pool = executor is None
+        self._pool = executor or ThreadPoolExecutor(
             max_workers=max(1, settings.ews_max_concurrency),
             thread_name_prefix="ews",
         )
+        self._slots = request_slots
+        self._version = version
         self.last_connection_error: Optional[str] = None
         self._folder_cache: Dict[str, Any] = {}
         self._folder_cache_ts = 0.0
@@ -371,6 +449,19 @@ class EWSGateway:
         """Thread-safe snapshot of the authentication circuit breaker."""
         return self._breaker.status()
 
+    @property
+    def rejected(self) -> bool:
+        """True once Exchange refused this gateway's credential for good."""
+        return bool(self._breaker.status()["permanent"])
+
+    def learned_version(self) -> Any:
+        """The server version this gateway negotiated, once it has one."""
+        account = self._account
+        protocol = getattr(account, "protocol", None) if account is not None else None
+        config = getattr(protocol, "config", None)
+        version = getattr(config, "version", None)
+        return version if getattr(version, "build", None) else None
+
     # ------------------------------------------------------------- account
 
     def _get_or_build_account(self) -> Account:
@@ -384,6 +475,18 @@ class EWSGateway:
         self._breaker.check_open()
         return self._get_or_build_account()
 
+    def _credentials(self) -> Tuple[Any, Optional[str]]:
+        """(exchangelib credentials, auth_type or None to negotiate)."""
+        s = self.settings
+        principal = self.principal
+        if principal is not None and principal.is_bearer:
+            return BearerCredentials(principal.mailbox, principal.token or ""), BEARER
+        creds = Credentials(s.ews_username or s.ews_email, s.ews_password or "")
+        if s.ews_auth_type_force:
+            logger.info("Using forced Exchange auth scheme: %s", s.ews_auth_type_force)
+            return creds, AUTH_TYPE_BY_SETTING[s.ews_auth_type_force]
+        return creds, None
+
     def _build_account(self) -> Account:
         s = self.settings
         BaseProtocol.TIMEOUT = s.request_timeout
@@ -392,17 +495,24 @@ class EWSGateway:
             configured_auth_type=s.ews_auth_type_force,
             on_rejection=lambda: self._breaker.record_rejection(),
         )
+        credentials, auth_type = self._credentials()
         kwargs: Dict[str, Any] = dict(
             service_endpoint=s.ews_server_url,
-            credentials=Credentials(s.ews_username or s.ews_email, s.ews_password or ""),
+            credentials=credentials,
             retry_policy=policy,
+            # exchangelib opens one TCP connection per session; matching the
+            # pool to the mailbox's request cap keeps threads from queueing
+            # inside the library.
+            max_connections=int(s.ews_mailbox_max_concurrency),
         )
-        if s.ews_auth_type_force:
-            logger.info("Using forced Exchange auth scheme: %s", s.ews_auth_type_force)
-            kwargs["auth_type"] = AUTH_TYPE_BY_SETTING[s.ews_auth_type_force]
+        if auth_type is not None:
+            kwargs["auth_type"] = auth_type
+        if self._version is not None:
+            kwargs["version"] = self._version.copy()
         config = Configuration(**kwargs)
+        self._cache_key = (config.service_endpoint, config.credentials)
         account = Account(
-            primary_smtp_address=s.ews_email,
+            primary_smtp_address=self.mailbox,
             config=config,
             autodiscover=False,
             access_type=DELEGATE,
@@ -416,28 +526,52 @@ class EWSGateway:
             protocol.config.retry_policy = policy
         return account
 
-    def reset(self) -> None:
-        """Drop the cached account AND exchangelib's protocol-cache entry.
+    def _evict_protocol(self, account: Optional[Account]) -> None:
+        """Close this gateway's sessions and drop ITS protocol-cache entry.
 
         Dropping only our Account is not enough: ``CachingProtocol`` hands
         the same wedged Protocol (with its already-negotiated auth type)
         right back on the next build, so a session that died mid-outage
-        would never renegotiate. Clearing the cache forces a genuinely
-        fresh session + auth negotiation on the next access.
+        would never renegotiate. The cache is global to the process and
+        never evicts on its own, so only this gateway's key is removed —
+        clearing it all would cut every other mailbox's live sessions — and
+        removing it is what keeps per-token protocols from accumulating.
         """
-        with self._account_lock:
-            if self._account is not None:
-                try:
-                    self._account.protocol.close()
-                except Exception:
-                    pass
-                self._account = None
+        protocol = getattr(account, "protocol", None) if account is not None else None
+        if protocol is not None:
+            try:
+                protocol.close()
+            except Exception:
+                pass
+        key = self._cache_key
+        if key is None:
+            return
         try:
-            CachingProtocol.clear_cache()
+            with CachingProtocol._protocol_cache_lock:
+                entry = CachingProtocol._protocol_cache.get(key)
+                if entry is not None and (
+                    protocol is None or entry[0] is protocol
+                    or isinstance(entry[0], Exception)
+                ):
+                    del CachingProtocol._protocol_cache[key]
         except Exception as e:
-            logger.debug("protocol cache clear failed: %s", e)
+            logger.debug("protocol cache eviction failed: %s", e)
+
+    def reset(self) -> None:
+        """Drop the cached account and this credential's protocol-cache
+        entry, forcing a genuinely fresh session + auth negotiation on the
+        next access."""
+        with self._account_lock:
+            account, self._account = self._account, None
+            self._evict_protocol(account)
         self._folder_cache.clear()
         self._folder_cache_ts = 0.0
+
+    def close(self) -> None:
+        """Release everything this gateway holds (idle eviction, shutdown)."""
+        self.reset()
+        if self._owns_pool:
+            self._pool.shutdown(wait=False, cancel_futures=True)
 
     def _handle_auth_rejection(
         self, exc: UnauthorizedError, thread_breaker_before: int
@@ -533,8 +667,19 @@ class EWSGateway:
             self._breaker.release_half_open()
 
     async def call(self, fn: Callable[[Account], Any]) -> Any:
-        """Run blocking EWS work on the bounded pool; the pool size IS the
-        EWS concurrency cap (polite guest on the per-user throttle budget)."""
+        """Run blocking EWS work on the bounded worker pool.
+
+        Two caps apply: the mailbox's request slots (when given) bound how
+        many requests ONE mailbox has in flight — waiting here, on the event
+        loop, instead of holding a worker thread — and the shared pool size
+        bounds the whole process.
+        """
+        if self._slots is None:
+            return await self._call_on_pool(fn)
+        async with self._slots:
+            return await self._call_on_pool(fn)
+
+    async def _call_on_pool(self, fn: Callable[[Account], Any]) -> Any:
         loop = asyncio.get_running_loop()
         seq_gate, claimed = self._breaker.before_call()
 

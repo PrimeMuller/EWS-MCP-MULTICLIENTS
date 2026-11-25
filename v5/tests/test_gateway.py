@@ -71,29 +71,183 @@ def test_probe_failure_is_reported_not_cached():
     assert gw.last_connection_error is None
 
 
-def test_reset_evicts_protocol_cache_and_folder_cache(monkeypatch):
-    cleared = []
-    monkeypatch.setattr(client_mod.CachingProtocol, "clear_cache",
-                        lambda: cleared.append(True))
+def test_reset_evicts_own_protocol_entry_and_folder_cache():
     gw, account = _gateway_with_mock_account()
+    key = ("https://ews.example/EWS/Exchange.asmx", "creds-of-this-gateway")
+    gw._cache_key = key
+    CachingProtocol._protocol_cache[key] = (account.protocol, None)
     gw._folder_cache = {"path": object()}
     gw._folder_cache_ts = 123.0
-    gw.reset()
-    assert gw._account is None
-    account.protocol.close.assert_called_once()
-    assert cleared == [True]  # without this, the wedged Protocol comes back
-    assert gw._folder_cache == {}
-    assert gw._folder_cache_ts == 0.0
+    try:
+        gw.reset()
+        assert gw._account is None
+        account.protocol.close.assert_called_once()
+        # Without this the wedged Protocol would come straight back.
+        assert key not in CachingProtocol._protocol_cache
+        assert gw._folder_cache == {}
+        assert gw._folder_cache_ts == 0.0
+    finally:
+        CachingProtocol._protocol_cache.pop(key, None)
 
 
-def test_reset_survives_close_and_clear_failures(monkeypatch):
-    monkeypatch.setattr(
-        client_mod.CachingProtocol, "clear_cache",
-        lambda: (_ for _ in ()).throw(RuntimeError("cache locked")))
+def test_reset_survives_close_failures_and_never_clears_other_protocols():
     gw, account = _gateway_with_mock_account()
     account.protocol.close.side_effect = OSError("socket gone")
-    gw.reset()  # must not raise
-    assert gw._account is None
+    other_key = ("https://ews.example/EWS/Exchange.asmx", "someone-else")
+    other = MagicMock(name="other-protocol")
+    CachingProtocol._protocol_cache[other_key] = (other, None)
+    try:
+        gw.reset()  # must not raise
+        assert gw._account is None
+        assert CachingProtocol._protocol_cache[other_key] == (other, None)
+        other.close.assert_not_called()
+    finally:
+        CachingProtocol._protocol_cache.pop(other_key, None)
+
+
+def _no_network_version(monkeypatch):
+    monkeypatch.setattr(
+        Version, "guess",
+        classmethod(lambda cls, protocol, api_version_hint=None: Version(build=EXCHANGE_2016)),
+    )
+
+
+def test_bearer_gateway_presents_the_callers_token_and_nothing_else(monkeypatch):
+    from ewsmcp.identity import Principal
+
+    _no_network_version(monkeypatch)
+    token = "eyJ.header-payload.sig"
+    principal = Principal(mailbox="alice@corp.example", token=token, fingerprint="f1")
+    gw = EWSGateway(make_settings(), principal=principal)
+    try:
+        account = gw._build_account()
+        assert account.primary_smtp_address == "alice@corp.example"
+        assert account.protocol.auth_type == client_mod.BEARER
+        assert token not in repr(account.protocol.credentials)
+        session = account.protocol.create_session()
+        prepared = requests.Request("POST", "https://ews.example/EWS/Exchange.asmx").prepare()
+        session.auth(prepared)
+        assert prepared.headers["Authorization"] == f"Bearer {token}"
+        session.close()
+        # Bearer credentials never fall back to the configured service account.
+        assert account.protocol.credentials.username == "alice@corp.example"
+    finally:
+        gw.close()
+
+
+def test_two_tokens_get_two_protocols_and_closing_one_spares_the_other(monkeypatch):
+    from ewsmcp.identity import Principal
+
+    _no_network_version(monkeypatch)
+    settings = make_settings()
+    gw_a = EWSGateway(settings, principal=Principal(
+        mailbox="alice@corp.example", token="a.b.c", fingerprint="fa"))
+    gw_b = EWSGateway(settings, principal=Principal(
+        mailbox="bob@corp.example", token="d.e.f", fingerprint="fb"))
+    try:
+        proto_a = gw_a._build_account().protocol
+        proto_b = gw_b._build_account().protocol
+        assert proto_a is not proto_b
+        assert gw_a._cache_key in CachingProtocol._protocol_cache
+        gw_a.close()
+        assert gw_a._cache_key not in CachingProtocol._protocol_cache
+        assert CachingProtocol._protocol_cache[gw_b._cache_key][0] is proto_b
+    finally:
+        gw_a.close()
+        gw_b.close()
+
+
+def test_bearer_gateway_latches_after_a_single_rejection():
+    from ewsmcp.identity import Principal
+
+    gw = EWSGateway(make_settings(ews_auth_max_rejections=3), principal=Principal(
+        mailbox="alice@corp.example", token="a.b.c", fingerprint="fa"))
+    try:
+        assert gw.rejected is False
+        gw._breaker.record_rejection()
+        assert gw.rejected is True
+        with pytest.raises(ToolError) as info:
+            gw._breaker.check_open()
+        assert info.value.code == "auth_failed"
+    finally:
+        gw.close()
+
+
+def test_static_gateway_keeps_the_configured_rejection_budget():
+    gw = EWSGateway(make_settings(ews_auth_max_rejections=3))
+    try:
+        gw._breaker.record_rejection()
+        assert gw.rejected is False
+    finally:
+        gw.close()
+
+
+def test_learned_version_is_handed_to_new_gateways_as_a_copy(monkeypatch):
+    from ewsmcp.identity import Principal
+
+    def no_guess(cls, protocol, api_version_hint=None):
+        raise AssertionError("a known version must skip the version probe")
+
+    monkeypatch.setattr(Version, "guess", classmethod(no_guess))
+    known = Version(build=EXCHANGE_2016)
+    gw = EWSGateway(make_settings(), principal=Principal(
+        mailbox="alice@corp.example", token="a.b.c", fingerprint="fa"), version=known)
+    try:
+        assert gw.learned_version() is None  # nothing negotiated yet
+        account = gw._get_or_build_account()
+        assert account.protocol.version == known
+        assert account.protocol.config.version is not known
+        assert gw.learned_version() == known
+    finally:
+        gw.close()
+
+
+def test_request_slots_cap_one_mailbox_and_queue_on_the_event_loop():
+    import asyncio
+    import threading
+
+    async def scenario():
+        slots = asyncio.Semaphore(1)
+        gw = EWSGateway(make_settings(ews_max_concurrency=4), request_slots=slots)
+        gw._account = MagicMock(name="account")
+        active, peak = [0], [0]
+        guard = threading.Lock()
+
+        def work(_account):
+            with guard:
+                active[0] += 1
+                peak[0] = max(peak[0], active[0])
+            import time as _t
+            _t.sleep(0.05)
+            with guard:
+                active[0] -= 1
+            return True
+
+        try:
+            results = await asyncio.gather(*(gw.call(work) for _ in range(4)))
+        finally:
+            gw.close()
+        return results, peak[0]
+
+    results, peak = asyncio.run(scenario())
+    assert results == [True] * 4
+    assert peak == 1
+
+
+def test_gateways_can_share_one_worker_pool():
+    from concurrent.futures import ThreadPoolExecutor
+
+    pool = ThreadPoolExecutor(max_workers=2)
+    try:
+        gw1 = EWSGateway(make_settings(), executor=pool)
+        gw2 = EWSGateway(make_settings(), executor=pool)
+        assert gw1._pool is pool and gw2._pool is pool
+        gw1.close()
+        # Closing one gateway must not shut down the shared pool.
+        assert pool.submit(lambda: 7).result(timeout=5) == 7
+        gw2.close()
+    finally:
+        pool.shutdown(wait=True)
 
 
 def test_resolve_folder_distinguished_names_and_unknown_not_found(tmp_path, monkeypatch):
