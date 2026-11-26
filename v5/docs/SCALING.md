@@ -2,9 +2,9 @@
 
 `EWS_AUTH_MODE=bearer` turns one deployment into a service for a whole organisation. Every HTTP
 request carries the user's own EWS OAuth2 access token (`Authorization: Bearer <token>`), and the
-server acts on that user's mailbox and nothing else. The server holds no Exchange credentials, runs
-no background polling, and authenticates no one: tokens are issued and validated upstream, and
-Exchange checks every token on every request.
+server acts on that user's mailbox and nothing else. The server holds no Exchange credentials and
+runs no background polling. Tokens are issued by your identity provider; the server verifies each
+one locally — signature, issuer, audience, expiry — and Exchange checks it again on every request.
 
 This page explains how a call is served, how the server keeps Exchange safe, how to size a
 deployment, and which settings matter. For the rules behind it see
@@ -23,8 +23,12 @@ flowchart LR
     T --> A["The mailbox's audit chain"]
 ```
 
-1. **HTTP layer.** No token, a malformed token, an expired token (`exp`, 60 s skew) or a token
-   without the configured claims gets HTTP `401` with a `WWW-Authenticate: Bearer` challenge. A
+1. **HTTP layer.** The token is verified locally: its signature against your identity provider's
+   keys, the algorithm (asymmetric only — never `none` or HMAC), `iss`, `aud` and `exp`/`nbf`
+   (60 s skew). No token, a bad signature, a foreign issuer or audience, an expired token, or a
+   token without the configured claims gets HTTP `401` with a `WWW-Authenticate: Bearer`
+   challenge — before Exchange is contacted. If the provider's keys cannot be fetched, the answer
+   is `503`. A
    token Exchange already rejected is refused here too. When `MCP_API_KEY` is set, the service key
    travels in `X-API-Key`, because `Authorization` carries the user's token.
 2. **Policy gates** that need no mailbox: the send kill-switch, the capability tier, and the
@@ -42,10 +46,24 @@ flowchart LR
 
 No tool takes a mailbox argument. The mailbox always comes from the token.
 
+## Checking the token
+
+| setting | example | what it is for |
+|---|---|---|
+| `EWS_TOKEN_JWKS_URL` | ADFS: `https://adfs.corp.example/adfs/discovery/keys`; Entra: `https://login.microsoftonline.com/<tenant>/discovery/v2.0/keys` | Where the provider publishes its signing keys (`https://` or `file://`). Fetched with the same TLS trust as Exchange traffic; set `REQUESTS_CA_BUNDLE` for an internal CA. |
+| `EWS_TOKEN_ISSUER` | ADFS: usually `http://adfs.corp.example/adfs/services/trust` | Accepted `iss` values, comma-separated. Copy it from a real token. |
+| `EWS_TOKEN_AUDIENCE` | `https://mail.corp.example/` | Accepted `aud` values, comma-separated: what your provider puts in EWS tokens. |
+| `EWS_TOKEN_ALGORITHMS` | `RS256` | Accepted signing algorithms; asymmetric only. |
+| `EWS_TOKEN_VALIDATION` | `signature` | `none` skips the local check and leaves validation to Exchange; use it only when a gateway in front already verified the token. |
+
+Keys are cached and refreshed hourly. A token naming an unknown key id makes the server re-fetch the
+keys at most once a minute, so made-up key ids cannot make it hammer your identity provider. Each
+token is verified once per pod and remembered until it expires. Access tokens are reused on every
+call for their lifetime, so there is no one-time nonce check; replay is limited by expiry and TLS.
+
 ## Who the caller is
 
-The server needs two facts from the token's claims, read without verifying the signature (Exchange
-verifies it, and the token proof happens before any stored state is used):
+Two facts come from the verified claims:
 
 | setting | default | what it is for |
 |---|---|---|
@@ -175,6 +193,9 @@ See [SAFETY.md](SAFETY.md#mail-written-to-steer-the-assistant).
 | `EWS_AUTH_MODE` | `bearer` | Serve many mailboxes from callers' tokens (requires `MCP_TRANSPORT=http`). |
 | `EWS_TOKEN_MAILBOX_CLAIMS` | `email,upn,preferred_username,unique_name` | Claims holding the mailbox address. |
 | `EWS_TOKEN_IDENTITY_CLAIM` | unset | Stable user id claim (e.g. `sid`) that keys stored state. |
+| `EWS_TOKEN_VALIDATION` | `signature` | Verify tokens locally (`none` leaves it to Exchange). |
+| `EWS_TOKEN_JWKS_URL` / `EWS_TOKEN_ISSUER` / `EWS_TOKEN_AUDIENCE` | required with `signature` | The provider's keys, accepted `iss`, accepted `aud`. |
+| `EWS_TOKEN_ALGORITHMS` | `RS256` | Accepted signing algorithms (asymmetric only). |
 | `EWS_MAX_CONCURRENCY` | `32` | Exchange requests in flight per process. |
 | `EWS_QUEUE_TIMEOUT_SECONDS` | `10` | Longest wait for a worker before a call is shed. |
 | `EWS_MAILBOX_MAX_CONCURRENCY` | `2` | Exchange requests in flight per mailbox per process. |

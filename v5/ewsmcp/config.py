@@ -11,6 +11,12 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 # a sync client onto other machines or a vendor cloud.
 _SYNCED_MARKERS = ("onedrive", "dropbox", "google drive", "googledrive", "icloud")
 
+# Asymmetric JWS algorithms a caller's token may be signed with. Never
+# "none" and never HMAC: with a shared secret the "public key" would sign.
+ALLOWED_TOKEN_ALGORITHMS = frozenset({
+    "RS256", "RS384", "RS512", "PS256", "PS384", "PS512", "ES256", "ES384", "ES512",
+})
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
@@ -30,6 +36,16 @@ class Settings(BaseSettings):
     # every token and keys the user's stored state instead of the address.
     ews_token_identity_claim: Optional[str] = Field(
         default=None, pattern=r"^[A-Za-z0-9_:./-]{1,64}$")
+    # Bearer mode: verify every token locally before anything else runs.
+    # "signature" (the bearer default) checks the signature against the
+    # identity provider's keys, the algorithm, iss, aud and exp; "none"
+    # leaves validation to Exchange — only for a gateway in front that
+    # already verified the token.
+    ews_token_validation: Optional[Literal["signature", "none"]] = None
+    ews_token_jwks_url: Optional[str] = None  # https://... or file://...
+    ews_token_issuer: Optional[str] = None  # comma-separated accepted iss values
+    ews_token_audience: Optional[str] = None  # comma-separated accepted aud values
+    ews_token_algorithms: str = "RS256"  # comma-separated, asymmetric only
 
     # --- Exchange upstream -------------------------------------------------
     ews_server_url: str
@@ -177,6 +193,8 @@ class Settings(BaseSettings):
             self.ews_mailbox_calls_per_minute = 60 if bearer else 0
         if self.ews_mark_untrusted_content is None:
             self.ews_mark_untrusted_content = bearer
+        if self.ews_token_validation is None:
+            self.ews_token_validation = "signature" if bearer else "none"
         if not bearer:
             if not (self.ews_email or "").strip():
                 raise ValueError("EWS_EMAIL is required when EWS_AUTH_MODE=static.")
@@ -190,7 +208,33 @@ class Settings(BaseSettings):
                 "EWS_SEMANTIC_INDEX is single-mailbox (its index has no mailbox "
                 "column) and would mix users' mail in bearer mode; set it to none."
             )
+        if self.ews_token_validation == "signature":
+            self._check_token_validation()
         return self
+
+    def _check_token_validation(self) -> None:
+        missing = [
+            name for name, value in (
+                ("EWS_TOKEN_JWKS_URL", self.ews_token_jwks_url),
+                ("EWS_TOKEN_ISSUER", self.ews_token_issuer),
+                ("EWS_TOKEN_AUDIENCE", self.ews_token_audience),
+            ) if not (value or "").strip()
+        ]
+        if missing:
+            raise ValueError(
+                "Bearer mode verifies every token's signature, issuer and audience: "
+                f"set {', '.join(missing)} (or EWS_TOKEN_VALIDATION=none to leave "
+                "validation to Exchange and a gateway that already checks tokens)."
+            )
+        if not self.ews_token_jwks_url.strip().lower().startswith(("https://", "file://")):
+            raise ValueError("EWS_TOKEN_JWKS_URL must be an https:// or file:// URL.")
+        algorithms = [a.strip() for a in self.ews_token_algorithms.split(",") if a.strip()]
+        refused = [a for a in algorithms if a not in ALLOWED_TOKEN_ALGORITHMS]
+        if refused or not algorithms:
+            raise ValueError(
+                f"EWS_TOKEN_ALGORITHMS accepts only {', '.join(sorted(ALLOWED_TOKEN_ALGORITHMS))}"
+                f"; refused: {', '.join(refused) or '(empty)'}."
+            )
 
     @model_validator(mode="after")
     def _resolve_data_dir(self) -> "Settings":

@@ -22,6 +22,10 @@
   dropped from bodies, meeting descriptions and HTML attachments (`hidden_text_removed`), and
   sender-written text can be wrapped in nonce-marked `<untrusted-content>` blocks
   (`EWS_MARK_UNTRUSTED_CONTENT`, on in bearer mode).
+- **Local token validation in bearer mode** (`EWS_TOKEN_VALIDATION=signature`, the default):
+  signature against the identity provider's JWKS (`EWS_TOKEN_JWKS_URL`), asymmetric algorithms
+  only, `iss` (`EWS_TOKEN_ISSUER`), `aud` (`EWS_TOKEN_AUDIENCE`) and `exp`/`nbf`; bad tokens get
+  HTTP 401 before Exchange is contacted.
 - Bearer-mode `/metrics` gauges and a bearer-mode boot smoke in CI.
 
 ### Changed

@@ -28,7 +28,8 @@ ENDPOINT = "https://mail.corp.example/EWS/Exchange.asmx"
 
 
 def bearer_settings(**overrides):
-    base = dict(ews_auth_mode="bearer", mcp_transport="http", ews_email=None)
+    base = dict(ews_auth_mode="bearer", mcp_transport="http", ews_email=None,
+                ews_token_validation="none")  # these tests use unsigned tokens
     base.update(overrides)
     return make_settings(**base)
 
@@ -121,7 +122,8 @@ def _reset_forged():
 
 
 def test_bearer_mode_needs_no_service_credentials_and_picks_scale_defaults():
-    s = Settings(ews_server_url=ENDPOINT, ews_auth_mode="bearer", mcp_transport="http")
+    s = Settings(ews_server_url=ENDPOINT, ews_auth_mode="bearer", mcp_transport="http",
+                 ews_token_validation="none")
     assert s.bearer_mode and s.ews_email is None
     assert s.ews_max_concurrency == 32
     assert s.ews_cache_enabled is False
@@ -135,8 +137,10 @@ def test_static_mode_still_requires_a_mailbox():
 
 
 def test_bearer_mode_mirror_is_opt_in_and_a_short_snippet_window():
-    off = Settings(ews_server_url=ENDPOINT, ews_auth_mode="bearer", mcp_transport="http")
+    off = Settings(ews_server_url=ENDPOINT, ews_auth_mode="bearer", mcp_transport="http",
+                 ews_token_validation="none")
     on = Settings(ews_server_url=ENDPOINT, ews_auth_mode="bearer", mcp_transport="http",
+                  ews_token_validation="none",
                   ews_cache_enabled=True)
     assert off.ews_cache_enabled is False
     assert on.ews_cache_enabled is True
@@ -150,7 +154,8 @@ def test_bearer_mode_mirror_is_opt_in_and_a_short_snippet_window():
     ({"ews_semantic_index": "pgvector"}, "EWS_SEMANTIC_INDEX"),
 ])
 def test_bearer_mode_refuses_settings_that_would_mix_mailboxes(overrides, message):
-    base = dict(ews_server_url=ENDPOINT, ews_auth_mode="bearer", mcp_transport="http")
+    base = dict(ews_server_url=ENDPOINT, ews_auth_mode="bearer", mcp_transport="http",
+                ews_token_validation="none")
     base.update(overrides)
     with pytest.raises(ValidationError, match=message):
         Settings(**base)

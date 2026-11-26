@@ -156,6 +156,7 @@ class Context:
     mailbox: str = ""  # the mailbox this context acts on ("" = not bound)
     pool: Any = None  # SessionPool (bearer mode)
     session: Any = None  # MailboxSession this context is bound to
+    token_verifier: Any = None  # tokens.TokenVerifier (bearer mode)
     circuit: CircuitState = field(default_factory=CircuitState)
 
     def __post_init__(self) -> None:

@@ -4,7 +4,8 @@ Every setting in `ews-mcp` comes from an environment variable and defaults to a 
 `draft` tier, sending off, local `stdio` transport, and local-only storage. In the default static
 mode only `EWS_SERVER_URL` and `EWS_EMAIL` are required to start the server; in bearer mode (one
 deployment for many users, see [Many mailboxes](#many-mailboxes-bearer-mode)) `EWS_SERVER_URL`,
-`EWS_AUTH_MODE=bearer` and `MCP_TRANSPORT=http` are enough.
+`EWS_AUTH_MODE=bearer`, `MCP_TRANSPORT=http`, and the token checks (`EWS_TOKEN_JWKS_URL`,
+`EWS_TOKEN_ISSUER`, `EWS_TOKEN_AUDIENCE`) are enough.
 
 ## How settings are read
 
@@ -414,6 +415,11 @@ protects Exchange and how to size it: [SCALING.md](SCALING.md).
 | `EWS_AUTH_MODE` | `'static'` | `static`, `bearer` | `bearer` requires `MCP_TRANSPORT=http`, refuses `EWS_SEMANTIC_INDEX=pgvector`, and needs no `EWS_EMAIL`/password. |
 | `EWS_TOKEN_MAILBOX_CLAIMS` | `'email,upn,preferred_username,unique_name'` | - | Token claims holding the mailbox address, first match wins. |
 | `EWS_TOKEN_IDENTITY_CLAIM` | `None` | - | Stable user id claim (e.g. `sid`); when set it is required and keys the user's stored state. |
+| `EWS_TOKEN_VALIDATION` | `'signature'` in bearer mode | `signature`, `none` | Verify each token locally (signature, algorithm, `iss`, `aud`, `exp`/`nbf`) before anything else; `none` leaves validation to Exchange and a gateway in front. |
+| `EWS_TOKEN_JWKS_URL` | `None` | `https://` or `file://` | The identity provider's signing keys (JWKS); required with `signature`. |
+| `EWS_TOKEN_ISSUER` | `None` | - | Accepted `iss` values, comma-separated; required with `signature`. |
+| `EWS_TOKEN_AUDIENCE` | `None` | - | Accepted `aud` values, comma-separated; required with `signature`. |
+| `EWS_TOKEN_ALGORITHMS` | `'RS256'` | RS/PS/ES 256/384/512 | Accepted signing algorithms; `none` and HMAC are always refused. |
 | `EWS_MAILBOX_IDLE_SECONDS` | `1800` | ge 60 | Idle time before a user's session (connections, mirror) is closed. |
 | `EWS_MAX_MAILBOXES` | `2000` | ge 1 | Sessions per process before the least recently used idle ones close. |
 | `EWS_MAILBOX_CALLS_PER_MINUTE` | `0` static, `60` bearer | ge 0 | Tool calls per mailbox per minute; `rate_capped` beyond it. |

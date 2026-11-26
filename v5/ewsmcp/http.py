@@ -19,6 +19,7 @@ from .identity import (
     principal_from_bearer,
     use_principal,
 )
+from .tokens import TokenKeysUnavailable
 from .server import (
     build_context,
     build_mcp_server,
@@ -68,14 +69,22 @@ def _authorized(headers, api_key: str, *, allow_bearer: bool = True) -> bool:
     return False
 
 
-def _principal_for(headers, claims, identity_claim=None) -> "tuple[Optional[Principal], str]":
+async def _principal_for(headers, claims, identity_claim=None,
+                         verifier=None) -> "tuple[Optional[Principal], int, str]":
+    """(principal, status, reason): verify the token locally when a verifier
+    is configured, then read who the caller is from its claims."""
     token = bearer_token_from_headers(headers)
     if token is None:
-        return None, "missing bearer token"
+        return None, 401, "missing bearer token"
     try:
-        return principal_from_bearer(token, claims=claims, identity_claim=identity_claim), ""
+        payload = await verifier.averify(token) if verifier is not None else None
+        principal = principal_from_bearer(token, claims=claims, identity_claim=identity_claim,
+                                          payload=payload)
+        return principal, 200, ""
+    except TokenKeysUnavailable:
+        return None, 503, "the identity provider's signing keys are unavailable"
     except BearerError as exc:
-        return None, f"bearer token not usable ({exc.reason})"
+        return None, 401, f"bearer token not usable ({exc.reason})"
 
 
 async def _send_json(send, status: int, payload: Dict[str, Any],
@@ -235,6 +244,7 @@ def build_app(ctx, settings, streamable: Optional[Any] = None):
     bearer = bool(getattr(settings, "bearer_mode", False))
     claims = parse_claim_order(getattr(settings, "ews_token_mailbox_claims", ""))
     identity_claim = getattr(settings, "ews_token_identity_claim", None) or None
+    verifier = getattr(ctx, "token_verifier", None)
 
     async def app(scope, receive, send):
         if scope["type"] == "lifespan":
@@ -294,7 +304,12 @@ def build_app(ctx, settings, streamable: Optional[Any] = None):
         if bearer:
             # Every non-public request acts for the mailbox named in the
             # caller's own token; no token, no mailbox, no access.
-            principal, reason = _principal_for(scope.get("headers"), claims, identity_claim)
+            principal, status, reason = await _principal_for(
+                scope.get("headers"), claims, identity_claim, verifier)
+            if status == 503:
+                return await _send_json(send, 503, {"ok": False, "error": {
+                    "code": "upstream_unavailable", "message": reason,
+                    "retry_after_s": 5}})
             if principal is None:
                 return await _send_bearer_401(send, reason)
             if ctx.pool is not None and ctx.pool.is_rejected(principal):

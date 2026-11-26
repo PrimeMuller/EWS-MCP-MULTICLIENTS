@@ -25,6 +25,7 @@ from .ids import (
     release_aliaser,
 )
 from .sessions import SessionParts, SessionPool
+from .tokens import build_token_verifier
 from .tools import build_registry
 from .tools.base import Context, dispatch
 
@@ -133,6 +134,7 @@ def build_bearer_context(settings: Settings) -> Context:
         aliaser=NullAliaser(),
         audit=audit,
         pool=pool,
+        token_verifier=build_token_verifier(settings),
     )
     build_registry(ctx)
     return ctx

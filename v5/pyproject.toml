@@ -12,6 +12,7 @@ dependencies = [
     "exchangelib==5.6.0",
     "jsonschema>=4.21",
     "mcp>=1.30,<2",
+    "PyJWT[crypto]>=2.8,<3",  # bearer mode: local token signature checks
     "pydantic>=2.8",
     "pydantic-settings>=2.5",
     "tzdata",  # zoneinfo source of truth: slim images/Windows ship no OS tzdb

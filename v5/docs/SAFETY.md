@@ -458,6 +458,8 @@ when they notify attendees). Their MCP annotations mark them `destructiveHint` a
 
 In bearer mode one process serves many users, so isolation is part of safety:
 
+- Every token is verified locally first — signature against the identity provider's keys,
+  algorithm, issuer, audience, expiry — and refused with `401` before Exchange is contacted.
 - The mailbox comes only from the caller's own token, never from an argument or a header.
 - Nothing stored for a mailbox is opened until Exchange has accepted the caller's token for it.
 - Aliases, the mirror, the audit chain, send windows, budgets, back-offs, idempotency receipts and

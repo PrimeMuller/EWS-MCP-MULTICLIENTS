@@ -43,8 +43,9 @@ below (§Tools, §Safety, §Mailboxes, §Throttling, §Untrusted content, §Ids,
    mailbox comes from the caller's own token, and everything stored for a
    mailbox — aliases, mirror, audit chain, budgets — lives in its own
    namespace and is touched only after Exchange accepted that token
-   (§Mailboxes). The server authenticates no one and holds no Exchange
-   credentials of its own in that mode.
+   (§Mailboxes). The server holds no Exchange credentials of its own in
+   that mode; it verifies each caller's token locally (signature, issuer,
+   audience, expiry) before reading who the caller is.
 7. **Exchange is protected before it is contacted.** Every limit — per
    mailbox, per process, Exchange's own stated back-off — refuses locally
    with `retry_after_s`; nothing blocks a worker for long and nothing polls
@@ -243,8 +244,13 @@ after connectivity; nothing irreversible without two model decisions):
 - **Identity** (`identity.py`): every request carries the caller's EWS
   OAuth2 access token. The mailbox address comes from its claims
   (`EWS_TOKEN_MAILBOX_CLAIMS`), optionally keyed by a stable id claim
-  (`EWS_TOKEN_IDENTITY_CLAIM`, e.g. `sid`); `exp`/`nbf` are checked
-  locally; the signature is left to Exchange. No token → HTTP 401.
+  (`EWS_TOKEN_IDENTITY_CLAIM`, e.g. `sid`). `tokens.py` verifies every
+  token first (`EWS_TOKEN_VALIDATION=signature`, the default): signature
+  against the provider's JWKS (`EWS_TOKEN_JWKS_URL`), algorithm from an
+  asymmetric allow-list (never `none`/HMAC), `iss`, `aud`, `exp`/`nbf`;
+  keys cached, unknown key ids re-fetch at most once a minute, verified
+  tokens remembered until expiry. No or bad token → HTTP 401 before
+  Exchange is contacted; Exchange still checks every request.
 - **Sessions** (`sessions.py`): one per user, created on demand, closed
   after `EWS_MAILBOX_IDLE_SECONDS` idle and LRU past `EWS_MAX_MAILBOXES`.
   A session owns one gateway per token (one Account/Protocol each; tokens

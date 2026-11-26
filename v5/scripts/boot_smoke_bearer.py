@@ -7,6 +7,8 @@ credentials, and an unreachable Exchange, then asserts:
 - the process boots and is ready without any credentials of its own;
 - every non-public route needs the caller's bearer token (401 + challenge),
   and the service API key rides X-API-Key;
+- tokens are verified locally (signature against a JWKS, issuer, audience):
+  a token signed by another key is refused before Exchange is contacted;
 - a call with a token is bound to its mailbox: the token proof reaches for
   Exchange and fails as upstream_unavailable, not as "no token" — over REST
   and over MCP Streamable HTTP, where the principal must survive the SDK's
@@ -17,24 +19,39 @@ credentials, and an unreachable Exchange, then asserts:
 
 Run from v5/:  python scripts/boot_smoke_bearer.py
 """
-import base64
 import json
 import os
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.request
+from pathlib import Path
+
+import jwt as pyjwt
+from cryptography.hazmat.primitives.asymmetric import rsa
 
 PORT = 8125
 BASE = f"http://127.0.0.1:{PORT}"
 KEY = "v5-smoke-key"
+ISSUER = "http://idp.example.invalid/adfs/services/trust"
+AUDIENCE = "https://mail.example.invalid/"
+SIGNING_KEY = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+STRANGER_KEY = rsa.generate_private_key(public_exponent=65537, key_size=2048)
 
 
-def jwt(claims):
-    def seg(obj):
-        return base64.urlsafe_b64encode(json.dumps(obj).encode()).rstrip(b"=").decode()
-    return f"{seg({'alg': 'RS256', 'typ': 'JWT'})}.{seg(claims)}.c2ln"
+def jwt(claims, key=SIGNING_KEY):
+    body = {"iss": ISSUER, "aud": AUDIENCE, **claims}
+    return pyjwt.encode(body, key, algorithm="RS256", headers={"kid": "smoke-1"})
+
+
+def write_jwks() -> str:
+    jwk = json.loads(pyjwt.algorithms.RSAAlgorithm.to_jwk(SIGNING_KEY.public_key()))
+    jwk.update(kid="smoke-1", use="sig", alg="RS256")
+    path = Path(tempfile.mkdtemp()) / "jwks.json"
+    path.write_text(json.dumps({"keys": [jwk]}), encoding="utf-8")
+    return path.as_uri()
 
 
 def request(method, path, payload=None, *, token=None, api_key=KEY, headers=None,
@@ -83,6 +100,9 @@ def main() -> int:
         "EWS_SERVER_URL": "https://192.0.2.1/EWS/Exchange.asmx",  # TEST-NET-1
         "MCP_TRANSPORT": "http", "MCP_HOST": "127.0.0.1", "MCP_PORT": str(PORT),
         "MCP_API_KEY": KEY,
+        "EWS_TOKEN_JWKS_URL": write_jwks(),
+        "EWS_TOKEN_ISSUER": ISSUER,
+        "EWS_TOKEN_AUDIENCE": AUDIENCE,
         "EWS_GLOBAL_CIRCUIT_THRESHOLD": "2",
         "REQUEST_TIMEOUT": "3", "LOG_LEVEL": "WARNING",
         "DATA_DIR": os.path.join(os.environ.get("TEMP", "/tmp"), "v5-smoke-bearer-data"),
@@ -126,6 +146,20 @@ def main() -> int:
                                  token=token, api_key=None)
         if status != 401:
             failures.append(f"missing X-API-Key: expected 401, got {status} {raw}")
+
+        forged = jwt({"upn": "smoke.user@example.invalid", "exp": time.time() + 3600},
+                     key=STRANGER_KEY)
+        status, _, raw = request("POST", "/api/tools/search_messages", {"limit": 1},
+                                 token=forged)
+        if status != 401 or "bad signature" not in raw:
+            failures.append(f"forged token: expected 401 bad signature, got {status} {raw}")
+
+        foreign = jwt({"upn": "smoke.user@example.invalid", "exp": time.time() + 3600,
+                       "aud": "https://graph.microsoft.com"})
+        status, _, raw = request("POST", "/api/tools/search_messages", {"limit": 1},
+                                 token=foreign)
+        if status != 401 or "wrong audience" not in raw:
+            failures.append(f"foreign audience: expected 401, got {status} {raw}")
 
         status, _, raw = request("POST", "/api/tools/get_server_status", {}, token=token)
         if status != 200 or as_json(raw).get("connection", {}).get("state") != "per_mailbox":

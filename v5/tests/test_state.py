@@ -318,6 +318,7 @@ def test_shared_state_without_a_shared_confirm_secret_warns_at_boot(monkeypatch,
     monkeypatch.delenv("SEND_CONFIRM_SECRET", raising=False)
     monkeypatch.setattr(state, "configure", lambda settings: state.backend())
     settings = make_settings(ews_auth_mode="bearer", mcp_transport="http", ews_email=None,
+                             ews_token_validation="none",
                              ews_state_backend="redis", ews_redis_url="redis://unused:6379/0")
     with caplog.at_level(logging.WARNING, logger="ewsmcp.server"):
         build_context(settings)
@@ -325,6 +326,7 @@ def test_shared_state_without_a_shared_confirm_secret_warns_at_boot(monkeypatch,
     caplog.clear()
     with caplog.at_level(logging.WARNING, logger="ewsmcp.server"):
         build_context(make_settings(ews_auth_mode="bearer", mcp_transport="http",
+                                    ews_token_validation="none",
                                     ews_email=None, ews_state_backend="redis",
                                     ews_redis_url="redis://unused:6379/0",
                                     send_confirm_secret="shared-secret"))

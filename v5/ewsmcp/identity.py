@@ -9,8 +9,10 @@ this module only READS it:
   cannot name another person's mailbox.
 * ``exp`` / ``nbf`` are checked locally, so an expired token never costs
   Exchange a round trip.
-* The signature is NOT checked here; Exchange checks it on every request.
-  Until Exchange has accepted a token once (the token proof in
+* The signature, issuer and audience are checked by ``tokens.py`` before
+  this module reads the claims (``EWS_TOKEN_VALIDATION=signature``, the
+  bearer-mode default), and Exchange checks the token again on every
+  request. Until Exchange has accepted a token once (the token proof in
   ``sessions.py``), nothing stored for its mailbox — aliases, mirror, audit —
   is read or written on its behalf.
 
@@ -151,12 +153,16 @@ def principal_from_bearer(
     claims: Sequence[str] = DEFAULT_MAILBOX_CLAIMS,
     identity_claim: Optional[str] = None,
     now: Optional[float] = None,
+    payload: Optional[dict] = None,
 ) -> Principal:
     """Read the mailbox and expiry from a JWT access token's payload.
 
     ``claims`` name where the mailbox address may be (first match wins);
     ``identity_claim``, when set, names a stable user identifier (e.g.
     ``sid``) that must be present and keys the user's stored state.
+
+    ``payload`` is the claim set ``tokens.TokenVerifier`` already verified;
+    without it the payload is decoded unverified (``EWS_TOKEN_VALIDATION=none``).
 
     Raises :class:`BearerError` when the token is not a JWS compact token,
     has expired, is not yet valid, names no mailbox in ``claims``, or lacks
@@ -167,7 +173,8 @@ def principal_from_bearer(
     parts = token.split(".")
     if len(parts) != 3:
         raise BearerError("malformed")
-    payload = _b64url_json(parts[1])
+    if payload is None:
+        payload = _b64url_json(parts[1])
     if not isinstance(payload, dict):
         raise BearerError("malformed")
     current = time.time() if now is None else now
