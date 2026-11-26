@@ -327,3 +327,45 @@ def test_a_users_calls_fill_their_mirror_and_eviction_deletes_it(tmp_path):
     assert first["mirrored"] is False  # the first call never waits for the mirror
     assert second["mirrored"] is True
     assert existed and not mirror.exists()  # deleted with the idle session
+
+
+# --- mail older than the window ----------------------------------------------
+
+
+def _windowed(tmp_path, live_items):
+    """A snippet mirror holding one recent message (alice, 2026-06-10) whose
+    inbox window starts on 2026-06-01; Exchange holds ``live_items``."""
+    ctx, account = snippet_ctx(tmp_path)
+    floor = int(datetime(2026, 6, 1, tzinfo=UTC).timestamp())
+    ctx.cache.set_sync_state("floor:inbox", None, floor)
+    account.inbox = _Query(live_items)
+    return ctx, account
+
+
+def test_a_search_reaching_past_the_window_asks_exchange(tmp_path):
+    old = _msg("RAW-OLD", subject="Contract", sender="dana@corp.example",
+               dt=datetime(2026, 4, 20, 9, 0, tzinfo=UTC))
+    ctx, _account = _windowed(tmp_path, [old])
+    res = _run(ctx, "search_messages", folder="f:inbox", sender="dana")
+    assert res["source"] == "live"  # the mirror never says "nothing" for older mail
+    assert [card["subject"] for card in res["items"]] == ["Contract"]
+
+
+def test_a_search_inside_the_window_is_answered_by_the_mirror(tmp_path):
+    ctx, _account = _windowed(tmp_path, [])
+    res = _run(ctx, "search_messages", folder="f:inbox", sender="alice", since="2026-06-05")
+    assert res["source"] == "cache" and res["count"] == 1 and res["total_available"] == 1
+
+
+def test_a_full_page_of_newest_matches_needs_no_exchange(tmp_path):
+    ctx, _account = _windowed(tmp_path, [])
+    res = _run(ctx, "search_messages", folder="f:inbox", sender="alice", limit=1)
+    assert res["source"] == "cache" and res["count"] == 1
+    assert res["total_available"] is None and res["next_offset"] == 1  # more may be older
+
+
+def test_overview_counts_unread_mail_from_exchange_when_the_mirror_is_a_window(tmp_path):
+    ctx, account = _windowed(tmp_path, [])
+    account.calendar.view = MagicMock(return_value=[])
+    ctx.cache.set_sync_state("events", None, time.time())
+    assert _run(ctx, "get_mailbox_overview")["source"] == "live"

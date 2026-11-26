@@ -439,7 +439,10 @@ without re-downloading or re-extracting and without writing mail to disk.
   calendar window — cost follows the window, not the mailbox (a first
   SyncFolderItems would walk the whole folder). Rows keep a
   `EWS_CACHE_BODY_CHARS` (300) snippet, so full reads and free-text search
-  go live; the mirror is deleted with the idle session. Off by default.
+  go live; the mirror is deleted with the idle session. It answers only
+  when it holds the whole answer (a search starting inside the recorded
+  `floor:<folder>`, or a full page of matches); anything reaching further
+  back, and the overview's unread total, go live. Off by default.
 - Provenance contract: every read is stamped `source: cache|live`
   (+ `as_of` for cache); `fresh:true` forces live. `EWS_CACHE_ENABLED=
   false` = pure EWS reads, fully functional.

@@ -101,6 +101,20 @@ def _cache_watermark(ctx: Context, folder_key: str) -> Optional[int]:
     return ctx.cache.watermark(f"item:{folder_key}")
 
 
+def _mirror_floor(ctx: Context, folder_key: str) -> Optional[int]:
+    """How far back a window mirror (bearer mode) holds this folder, or None
+    for a mirror that is treated as complete (static mode)."""
+    if ctx.cache is None:
+        return None
+    return ctx.cache.watermark(f"floor:{folder_key}")
+
+
+def _mirror_covers(floor: Optional[int], since_ts: Optional[int]) -> bool:
+    """True when every possible match lies inside the mirror: no window
+    edge, or a search that starts at or after it."""
+    return floor is None or (since_ts is not None and since_ts >= floor)
+
+
 def _mirror_has_bodies(ctx: Context) -> bool:
     """True when the mirror keeps whole cleaned bodies. A snippet mirror
     (bearer mode) never answers full reads or full-text search: those go to
@@ -1188,20 +1202,31 @@ async def _search_messages(ctx: Context, query: Optional[str] = None,
         as_of = _cache_watermark(ctx, folder_key)
         if as_of:
             try:
+                since_ts = int(since_dt.timestamp()) if since_dt else None
+                covered = _mirror_covers(_mirror_floor(ctx, folder_key), since_ts)
                 rows, total = await asyncio.to_thread(
                     ctx.cache.search_messages,
                     folders=[folder_key], text=query, sender=sender,
                     subject=subject,
-                    since_ts=int(since_dt.timestamp()) if since_dt else None,
+                    since_ts=since_ts,
                     until_ts=int(until_dt.timestamp()) if until_dt else None,
                     is_unread=is_unread, has_attachments=has_attachments,
                     categories=categories, importance=importance,
                     offset=offset, limit=limit,
                 )
-                cards = await asyncio.to_thread(
-                    lambda: [_row_card(ctx, r) for r in rows])
-                return _stamp(envelope(cards, total_available=total,
-                                       offset=offset), "cache", as_of)
+                # A window mirror answers only with the whole answer: a search
+                # inside its window, or a full page of matches (newer than
+                # anything it does not hold). Otherwise older mail may match:
+                # ask Exchange.
+                if covered or len(rows) >= limit:
+                    cards = await asyncio.to_thread(
+                        lambda: [_row_card(ctx, r) for r in rows])
+                    if covered:
+                        out = envelope(cards, total_available=total, offset=offset)
+                    else:
+                        out = envelope(cards, total_available=None, offset=offset,
+                                       next_offset=offset + limit)
+                    return _stamp(out, "cache", as_of)
             except ToolError:
                 raise
             except Exception as exc:
@@ -1290,6 +1315,10 @@ async def _search_messages(ctx: Context, query: Optional[str] = None,
 # --------------------------------------------------------------------------
 # 2b. check_messages: a whole list in one call
 # --------------------------------------------------------------------------
+
+class _AskExchange(Exception):
+    """The mirror cannot answer this completely; use the live path."""
+
 
 CHECK_MAX_VALUES = 200
 CHECK_MAX_HITS = 5
@@ -1445,6 +1474,8 @@ async def _check_messages(ctx: Context, values: Any, field: str = "subject",
     )
     since_ts = int(since_dt.timestamp()) if since_dt is not None else None
     until_ts = int(until_dt.timestamp()) if until_dt is not None else None
+    mirror_covered = bool(mirror_as_of) and _mirror_covers(
+        _mirror_floor(ctx, folder_key), since_ts)
 
     gate = asyncio.Semaphore(4)
     aborted = False
@@ -1479,6 +1510,9 @@ async def _check_messages(ctx: Context, values: Any, field: str = "subject",
                         matched_rows.append(r)
                         if len(matched_rows) >= CHECK_MAX_HITS:
                             break
+                    if not mirror_covered and len(matched_rows) < CHECK_MAX_HITS:
+                        # Older mail may match beyond the mirror's window.
+                        raise _AskExchange()
                     if matched_rows:
                         def build_cached() -> List[Dict[str, Any]]:
                             minted = ctx.aliaser.alias_many([
@@ -1509,6 +1543,8 @@ async def _check_messages(ctx: Context, values: Any, field: str = "subject",
                     return trimmed, "cache", as_of_iso
                 except ToolError:
                     raise
+                except _AskExchange:
+                    pass
                 except Exception as exc:
                     logger.warning(
                         "cache check_messages failed (%s) — falling back live", exc,
@@ -2679,8 +2715,11 @@ async def _get_mailbox_overview(ctx: Context, horizon_days: int = 1,
 
     # ---- pure mirror + watermark (sub-100ms warm) --------------------------
     as_of = _cache_watermark(ctx, "inbox") if not fresh else None
-    # Both halves must be mirrored: unread mail AND the calendar window.
-    if as_of and ctx.cache is not None and ctx.cache.watermark("events"):
+    # Both halves must be mirrored: unread mail AND the calendar window. A
+    # window mirror (bearer mode) cannot count unread mail older than its
+    # window, so the unread total then comes from Exchange.
+    if (as_of and ctx.cache is not None and ctx.cache.watermark("events")
+            and _mirror_floor(ctx, "inbox") is None):
         try:
             def read_mirror():
                 unread_total, rows = ctx.cache.unread_page(limit=10)

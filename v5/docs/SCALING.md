@@ -116,6 +116,10 @@ Prefer `query` over `subject` filters, which Exchange evaluates by scanning.
   calendar window. Its cost follows the window, never the size of the mailbox.
 - **Headers and a 300-character snippet** (`EWS_CACHE_BODY_CHARS`). Full bodies and free-text
   search always go live.
+- **Only whole answers.** The mirror answers a search only when it holds every possible match: the
+  search starts inside the window, or the mirror already found a full page of the newest matches.
+  A search that reaches further back — "the contract Dana sent in April" — goes to Exchange, and
+  the overview's unread total always comes from Exchange.
 - **Deleted after 30 idle minutes** (`EWS_MAILBOX_IDLE_SECONDS`), together with the session.
 
 The mirror makes repeated listings, the morning overview, `waiting_on` and contact history cheap.

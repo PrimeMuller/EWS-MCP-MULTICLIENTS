@@ -194,4 +194,7 @@ class WindowSync:
         gone = [raw_id for raw_id in self.store.window_changekeys(key, edge)
                 if raw_id not in listed]
         self.store.delete_messages_by_id(gone)
+        # Record how far back this folder's mirror reaches: readers use it to
+        # tell "nothing found" from "older than the mirror" (mail_read.py).
+        self.store.set_sync_state(f"floor:{key}", None, edge)
         self.store.set_sync_state(f"item:{key}", None, time.time())
