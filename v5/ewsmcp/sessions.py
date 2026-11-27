@@ -324,6 +324,14 @@ class SessionPool:
         while len(self._rejected) > MAX_REJECTED_TOKENS:
             self._rejected.popitem(last=False)
 
+    def note_rejected_gateway(self, gateway: Any) -> None:
+        """Exchange refused a proven token during a call (revoked, expired at
+        Exchange): remember it now, so the caller's next request gets HTTP
+        401 at the door instead of another round trip to Exchange."""
+        principal = getattr(gateway, "principal", None)
+        if principal is not None and principal.is_bearer and getattr(gateway, "rejected", False):
+            self._reject(principal)
+
     def is_rejected(self, principal: Principal) -> bool:
         """True when Exchange already refused this exact token."""
         return self._is_rejected(principal.fingerprint, self._clock())

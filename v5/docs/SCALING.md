@@ -28,9 +28,12 @@ flowchart LR
    (60 s skew). No token, a bad signature, a foreign issuer or audience, an expired token, or a
    token without the configured claims gets HTTP `401` with a `WWW-Authenticate: Bearer`
    challenge — before Exchange is contacted. If the provider's keys cannot be fetched, the answer
-   is `503`. A
-   token Exchange already rejected is refused here too. When `MCP_API_KEY` is set, the service key
-   travels in `X-API-Key`, because `Authorization` carries the user's token.
+   is `503`. A token Exchange already rejected — at its proof or during a later call (revoked,
+   account disabled) — is refused here too, with the same `401` and challenge, so the client
+   fetches a new token. The call that discovers the rejection answers `auth_failed` ("Exchange
+   rejected this access token"): over REST that is already `401` with the challenge; over MCP it is
+   a tool error, because the response has started by then. When `MCP_API_KEY` is set, the service
+   key travels in `X-API-Key`, because `Authorization` carries the user's token.
 2. **Policy gates** that need no mailbox: the send kill-switch, the capability tier, and the
    process-wide upstream circuit.
 3. **Binding.** The call is bound to the caller's *session* — their connections and stored state.

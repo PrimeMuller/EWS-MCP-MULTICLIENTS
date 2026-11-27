@@ -26,6 +26,10 @@
   signature against the identity provider's JWKS (`EWS_TOKEN_JWKS_URL`), asymmetric algorithms
   only, `iss` (`EWS_TOKEN_ISSUER`), `aud` (`EWS_TOKEN_AUDIENCE`) and `exp`/`nbf`; bad tokens get
   HTTP 401 before Exchange is contacted.
+- Bearer mode presents callers' tokens through exchangelib's `OAuth2AuthorizationCodeCredentials`
+  (never refreshed here, one protocol per token). A token Exchange rejects during a call is
+  remembered at once: the caller's next request gets HTTP 401 with `WWW-Authenticate: Bearer`, and
+  the error says to fetch a new token rather than to restart the server.
 - Bearer-mode `/metrics` gauges and a bearer-mode boot smoke in CI.
 
 ### Changed

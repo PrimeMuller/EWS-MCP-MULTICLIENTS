@@ -686,6 +686,8 @@ async def dispatch(ctx: Context, spec: ToolSpec, kwargs: Dict[str, Any],
                 record_backoff(ctx, wait)
         return err.to_dict()
     finally:
+        if pool is not None and ctx.session is not None and outcome == "auth_failed":
+            pool.note_rejected_gateway(ctx.gateway)
         if pool is not None and spec.requires_ews and not local_refusal:
             if outcome == "upstream_unavailable":
                 pool.note_upstream(False)

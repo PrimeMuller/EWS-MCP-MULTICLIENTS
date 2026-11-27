@@ -443,3 +443,23 @@ def test_tokens_without_the_configured_sid_get_401(tmp_path):
     status, _, body = _drive(build_app(ctx, ctx.settings), "/api/tools/whoami",
                              headers=[("authorization", f"Bearer {token_for('a@corp.example')}")])
     assert status == 401 and "identity claim" in body["error"]["message"]
+
+
+def test_a_token_exchange_rejects_mid_session_gets_401_at_the_door_next(tmp_path):
+    ctx = _http_ctx(tmp_path)
+    app = build_app(ctx, ctx.settings)
+    tok = token_for("alice@corp.example")
+
+    async def revoked(ctx, **_):
+        ctx.gateway.rejected = True  # what the gateway's breaker does on HTTP 401
+        raise ToolError("auth_failed", "Exchange rejected credentials (HTTP 401)")
+
+    ctx.registry["revoked"] = _spec("revoked", revoked)
+    assert _drive(app, "/api/tools/whoami", headers=[("authorization", f"Bearer {tok}")])[0] == 200
+    status, headers, _ = _drive(app, "/api/tools/revoked",
+                                headers=[("authorization", f"Bearer {tok}")])
+    assert status == 401 and headers[b"www-authenticate"].startswith(b"Bearer")
+    status, headers, body = _drive(app, "/api/tools/whoami",
+                                   headers=[("authorization", f"Bearer {tok}")])
+    assert status == 401 and "already rejected" in body["error"]["message"]
+    assert headers[b"www-authenticate"].startswith(b"Bearer")

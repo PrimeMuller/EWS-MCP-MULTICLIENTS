@@ -262,8 +262,12 @@ class AuthBreaker:
         cooldown_seconds: int = 900,
         max_rejections: int = 3,
         clock: Optional[Callable[[], float]] = None,
+        bearer: bool = False,
     ):
         self._cooldown = max(0, int(cooldown_seconds))
+        # Bearer mode guards one caller's token, not the server's own
+        # credentials: a rejection is answered with "get a new token".
+        self._bearer = bool(bearer)
         self._max_rejections = max(1, int(max_rejections))
         self._clock = clock
         self._lock = threading.Lock()
@@ -288,6 +292,9 @@ class AuthBreaker:
         return float(self._clock()) if self._clock is not None else time.time()
 
     def _error_locked(self, now: float) -> ToolError:
+        if self._permanent and self._bearer:
+            return ToolError("auth_failed", "Exchange rejected this access token.",
+                             hint=BEARER_HINT)
         if self._permanent:
             return ToolError(
                 "auth_failed",
@@ -481,6 +488,7 @@ class EWSGateway:
             # this gateway, and the caller must come back with a new token.
             max_rejections=1 if bearer else settings.ews_auth_max_rejections,
             clock=clock,
+            bearer=bearer,
         )
         self._account: Optional[Account] = None
         self._account_lock = threading.Lock()

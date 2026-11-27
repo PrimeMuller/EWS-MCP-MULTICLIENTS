@@ -172,6 +172,8 @@ def test_bearer_gateway_latches_after_a_single_rejection():
         with pytest.raises(ToolError) as info:
             gw._breaker.check_open()
         assert info.value.code == "auth_failed"
+        # The caller is told to get a new token, not to restart the server.
+        assert "fresh token" in info.value.hint and "restart" not in info.value.message
     finally:
         gw.close()
 
