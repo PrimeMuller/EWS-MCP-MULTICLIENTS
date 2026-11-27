@@ -269,27 +269,36 @@ def test_protocol_cache_is_evictable():
         CachingProtocol.clear_cache()
 
 
-def test_custom_auth_type_plugs_in_through_auth_type_map():
-    """Bearer tokens ride a custom auth type: exchangelib must accept any key
-    registered in transport.AUTH_TYPE_MAP and build each session's auth via
-    get_auth_instance(auth_type, username=..., password=...) for non-OAuth
-    credentials — both pinned here."""
-    from exchangelib.transport import AUTH_TYPE_MAP, get_auth_instance
+def test_oauth2_credentials_with_a_given_token_behave_as_relied_on():
+    """Bearer mode passes callers' tokens through OAuth2AuthorizationCodeCredentials
+    (ewsmcp.gateway.client.CallerTokenCredentials). Pinned here: a session built
+    from a token that is already present fetches nothing and sends it as
+    'Authorization: Bearer'; the base class hashes WITHOUT the token (why the
+    subclass overrides equality and hash); and auto-refresh is only wired with a
+    client id and secret, which are never given."""
+    import requests
+    from exchangelib import OAuth2AuthorizationCodeCredentials
+    from exchangelib.credentials import BaseOAuth2Credentials
 
-    from ewsmcp.gateway.client import BEARER, BearerCredentials, BearerTokenAuth
+    from ewsmcp.gateway.client import CallerTokenCredentials
 
-    assert AUTH_TYPE_MAP[BEARER] is BearerTokenAuth
-    auth = get_auth_instance(auth_type=BEARER, username="a@corp.example", password="tok")
-    assert isinstance(auth, BearerTokenAuth)
+    one = OAuth2AuthorizationCodeCredentials(access_token={"access_token": "t1"})
+    two = OAuth2AuthorizationCodeCredentials(access_token={"access_token": "t2"})
+    assert hash(one) == hash(two)  # the base class ignores the token
+    assert hash(CallerTokenCredentials("t1")) != hash(CallerTokenCredentials("t2"))
+    assert CallerTokenCredentials("t1") == CallerTokenCredentials("t1")
+    assert "auto_refresh_url" not in CallerTokenCredentials("t1").session_params()
+    assert callable(getattr(BaseOAuth2Credentials, "refresh", None))
     config = Configuration(
         service_endpoint="https://ews.example.com/EWS/Exchange.asmx",
-        credentials=BearerCredentials("a@corp.example", "tok"), auth_type=BEARER,
-        version=Version(build=EXCHANGE_2016),
+        credentials=CallerTokenCredentials("tok"), version=Version(build=EXCHANGE_2016),
     )
     CachingProtocol.clear_cache()
     try:
-        session = Protocol(config=config).create_session()
-        assert isinstance(session.auth, BearerTokenAuth)
+        session = Protocol(config=config).create_session()  # no token fetch
+        prepared = requests.Request("POST", config.service_endpoint).prepare()
+        session.auth(prepared)
+        assert prepared.headers["Authorization"] == "Bearer tok"
         session.close()
     finally:
         CachingProtocol.clear_cache()

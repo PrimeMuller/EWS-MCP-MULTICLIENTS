@@ -122,15 +122,18 @@ def test_bearer_gateway_presents_the_callers_token_and_nothing_else(monkeypatch)
     try:
         account = gw._build_account()
         assert account.primary_smtp_address == "alice@corp.example"
-        assert account.protocol.auth_type == client_mod.BEARER
+        assert account.protocol.auth_type == client_mod.OAUTH2
+        assert isinstance(account.protocol.credentials, client_mod.CallerTokenCredentials)
         assert token not in repr(account.protocol.credentials)
         session = account.protocol.create_session()
         prepared = requests.Request("POST", "https://ews.example/EWS/Exchange.asmx").prepare()
         session.auth(prepared)
         assert prepared.headers["Authorization"] == f"Bearer {token}"
         session.close()
-        # Bearer credentials never fall back to the configured service account.
-        assert account.protocol.credentials.username == "alice@corp.example"
+        # Never refreshed here, and no expiry the OAuth library could act on.
+        with pytest.raises(UnauthorizedError):
+            account.protocol.credentials.refresh(session=None)
+        assert set(account.protocol.credentials.access_token) == {"access_token", "token_type"}
     finally:
         gw.close()
 

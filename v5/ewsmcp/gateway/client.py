@@ -28,16 +28,17 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import AsyncExitStack, asynccontextmanager
 from typing import Any, AsyncIterator, Callable, Dict, List, Optional, Tuple
 
-import requests.auth
 from exchangelib import (
     BASIC,
     DELEGATE,
     DIGEST,
     NTLM,
+    OAUTH2,
     Account,
     Configuration,
     Credentials,
     EWSTimeZone,
+    OAuth2AuthorizationCodeCredentials,
 )
 from exchangelib.errors import (
     ErrorAccessDenied,
@@ -51,11 +52,10 @@ from exchangelib.protocol import (
     FaultTolerance,
     NoVerifyHTTPAdapter,
 )
-from exchangelib.transport import AUTH_TYPE_MAP
 
 from ..config import Settings
 from ..errors import AUTH_FAILED_HINT, ToolError, map_exception
-from ..identity import Principal
+from ..identity import Principal, token_fingerprint
 from ..throttle import LocalRefusal
 
 logger = logging.getLogger(__name__)
@@ -79,39 +79,38 @@ MAILBOX_REFUSED_HINT = (
 _MAILBOX_REFUSED = (ErrorAccessDenied, ErrorInvalidSmtpAddress, ErrorNonExistentMailbox)
 
 
-class BearerTokenAuth(requests.auth.AuthBase):
-    """Present an OAuth2 access token unchanged on every request.
+class CallerTokenCredentials(OAuth2AuthorizationCodeCredentials):
+    """One caller's access token, issued upstream (e.g. on-behalf-of) and used
+    as it is: exchangelib's own OAuth2 credentials, with three guards for a
+    token this server did not obtain and cannot renew.
 
-    exchangelib's own OAuth2 auth type drives a token-endpoint flow
-    (client id, refresh, ``TokenExpiredError`` loops). Here the token comes
-    from the caller, is never refreshed, and a rejection is final, so the
-    plain header is all that is needed. Instantiated by exchangelib's
-    ``get_auth_instance(auth_type, username=..., password=...)``.
+    - No expiry is given to the OAuth library. Otherwise it would itself
+      declare the token expired and ask exchangelib to refresh it, which
+      exchangelib retries immediately with no limit. Exchange decides
+      instead: an expired token gets HTTP 401, the gateway stops for good,
+      and the caller comes back with a new token.
+    - ``refresh`` refuses: tokens are never refreshed here.
+    - Equality and hash follow the token. The base class hashes without the
+      token, which would put every user's credentials in one slot of
+      exchangelib's protocol cache; here each token gets its own Protocol
+      and connections, and nothing is shared between users.
     """
 
-    def __init__(self, username: Optional[str] = None, password: Optional[str] = None):
-        self._token = password or ""
+    def __init__(self, token: str):
+        super().__init__(access_token={"access_token": token, "token_type": "Bearer"})
+        self._token_fingerprint = token_fingerprint(token)
 
-    def __call__(self, request: Any) -> Any:
-        request.headers["Authorization"] = f"Bearer {self._token}"
-        return request
+    def refresh(self, session: Any) -> None:
+        raise UnauthorizedError(
+            "Access tokens are not refreshed by this server; send a new token."
+        )
 
+    def __eq__(self, other: object) -> bool:
+        return (type(other) is type(self)
+                and other._token_fingerprint == self._token_fingerprint)
 
-# exchangelib validates ``Configuration.auth_type`` against this map and
-# builds each session's auth from it; registering the scheme here is how a
-# custom auth type plugs in (pinned in test_exchangelib_signatures.py).
-BEARER = "bearer token"
-AUTH_TYPE_MAP.setdefault(BEARER, BearerTokenAuth)
-
-
-class BearerCredentials(Credentials):
-    """One caller's access token. ``password`` holds the token; exchangelib
-    masks it in ``repr`` and keys its protocol cache on it, so every token
-    gets its own Protocol (and session pool) and nothing is shared between
-    users."""
-
-    def __init__(self, mailbox: str, token: str):
-        super().__init__(mailbox, token)
+    def __hash__(self) -> int:
+        return hash((type(self), self._token_fingerprint))
 
 WELL_KNOWN = {
     "f:inbox": "inbox", "f:sent": "sent", "f:drafts": "drafts",
@@ -552,7 +551,7 @@ class EWSGateway:
         s = self.settings
         principal = self.principal
         if principal is not None and principal.is_bearer:
-            return BearerCredentials(principal.mailbox, principal.token or ""), BEARER
+            return CallerTokenCredentials(principal.token or ""), OAUTH2
         creds = Credentials(s.ews_username or s.ews_email, s.ews_password or "")
         if s.ews_auth_type_force:
             logger.info("Using forced Exchange auth scheme: %s", s.ews_auth_type_force)
